@@ -5,7 +5,7 @@ on:
     - cron: "*/30 * * * *"  # Every 30 minutes
   push:
     paths:
-      - 'terraform/**'       # Run when Terraform files change
+      - 'terraform/**'
   workflow_dispatch:
 
 jobs:
@@ -32,8 +32,11 @@ jobs:
         id: plan
         run: |
           set +e
-          terraform plan -detailed-exitcode -out=tfplan.out
+          terraform plan -detailed-exitcode -out=tfplan.out > tfplan.log 2>&1
           echo "PLAN_EXIT=$?" >> $GITHUB_ENV
+          echo "--- TF PLAN OUTPUT ---"
+          cat tfplan.log
+          echo "--- END ---"
           set -e
 
       - name: Check for Drift
