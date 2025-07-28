@@ -1,0 +1,48 @@
+name: Detect Terraform Drift
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"  # Every 30 minutes
+  push:
+    paths:
+      - 'terraform/**'       # Run when Terraform files change
+  workflow_dispatch:
+
+jobs:
+  detect-drift:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Plan for Drift Detection
+        id: plan
+        run: |
+          terraform plan -detailed-exitcode -out=tfplan.out || echo "PLAN_EXIT=$?" >> $GITHUB_ENV
+
+      - name: Check for Drift
+        run: |
+          if [[ "$PLAN_EXIT" == "2" ]]; then
+            echo "⚠️ Drift detected!"
+            echo "DriftOutput<<EOF" >> $GITHUB_OUTPUT
+            terraform show -no-color tfplan.out >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          elif [[ "$PLAN_EXIT" == "0" ]]; then
+            echo "✅ No drift detected."
+          else
+            echo "❌ Error during terraform plan"
+            exit 1
+          fi
