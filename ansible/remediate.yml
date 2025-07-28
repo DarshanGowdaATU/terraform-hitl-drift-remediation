@@ -1,0 +1,10 @@
+---
+- name: Example Remediation
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Placeholder - Apply Terraform
+      command: terraform apply -auto-approve
+      args:
+        chdir: ../terraform
+
