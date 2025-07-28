@@ -32,10 +32,11 @@ jobs:
         id: plan
         run: |
           set +e
-          terraform plan -detailed-exitcode -out=tfplan.out > tfplan.log 2>&1
-          echo "PLAN_EXIT=$?" >> $GITHUB_ENV
+          PLAN_OUTPUT=$(terraform plan -detailed-exitcode -out=tfplan.out 2>&1)
+          PLAN_EXIT=$?
+          echo "PLAN_EXIT=$PLAN_EXIT" >> $GITHUB_ENV
           echo "--- TF PLAN OUTPUT ---"
-          cat tfplan.log
+          echo "$PLAN_OUTPUT"
           echo "--- END ---"
           set -e
 
