@@ -31,10 +31,14 @@ jobs:
       - name: Terraform Plan for Drift Detection
         id: plan
         run: |
-          terraform plan -detailed-exitcode -out=tfplan.out || echo "PLAN_EXIT=$?" >> $GITHUB_ENV
+          set +e
+          terraform plan -detailed-exitcode -out=tfplan.out
+          echo "PLAN_EXIT=$?" >> $GITHUB_ENV
+          set -e
 
       - name: Check for Drift
         run: |
+          echo "Terraform plan exit code: $PLAN_EXIT"
           if [[ "$PLAN_EXIT" == "2" ]]; then
             echo "⚠️ Drift detected!"
             echo "DriftOutput<<EOF" >> $GITHUB_OUTPUT
