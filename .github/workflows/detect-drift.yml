@@ -7,23 +7,6 @@ on:
     paths:
       - 'terraform/**'
   workflow_dispatch:
-    inputs:
-      simulate_drift:
-        description: "Create a small manual drift before planning?"
-        required: false
-        default: "false"
-        type: choice
-        options: ["false","true"]
-      drift_type:
-        description: "Type of drift to simulate"
-        required: false
-        default: "s3_tag"
-        type: choice
-        options: ["s3_tag"]
-      s3_bucket_name:
-        description: "S3 bucket name (managed by Terraform) for s3_tag drift"
-        required: false
-        default: ""
 
 jobs:
   detect-drift:
@@ -34,13 +17,15 @@ jobs:
         working-directory: terraform
 
     env:
-      AWS_REGION: us-east-1
+      AWS_REGION: us-east-1                 # backend region
       TF_IN_AUTOMATION: "true"
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      # Authenticate to AWS (uses your existing key secrets)
+      # If you move to OIDC later, swap to role-to-assume.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -48,6 +33,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Sanity check backend access (same bucket/table as backend.tf)
       - name: Verify backend (S3 + DynamoDB)
         run: |
           aws s3 ls s3://tf-state-l00187927 >/dev/null
@@ -57,34 +43,6 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.5.0
-
-      # ---- OPTIONAL: create a tiny, safe drift (S3 tag) ----
-      - name: Simulate drift (S3 tag)
-        if: ${{ github.event.inputs.simulate_drift == 'true' && github.event.inputs.drift_type == 's3_tag' && github.event.inputs.s3_bucket_name != '' }}
-        env:
-          BUCKET: ${{ github.event.inputs.s3_bucket_name }}
-        run: |
-          echo "Creating drift on bucket: ${BUCKET}"
-          # Read current tags (ignore if none)
-          aws s3api get-bucket-tagging --bucket "${BUCKET}" >/tmp/tags.json 2>/dev/null || echo '{"TagSet":[]}' >/tmp/tags.json
-          echo "Original tags:"; cat /tmp/tags.json || true
-
-          # Add or toggle a harmless tag
-          python3 - << 'PY'
-          import json,sys,os
-          path="/tmp/tags.json"
-          with open(path) as f:
-            data=json.load(f)
-          tags={t["Key"]:t["Value"] for t in data.get("TagSet",[])}
-          # Toggle a small drift tag
-          tags["drift_test"] = "on" if tags.get("drift_test")!="on" else "off"
-          new={"TagSet":[{"Key":k,"Value":v} for k,v in tags.items()]}
-          print(json.dumps(new))
-          PY
-          | tee /tmp/new_tags.json
-
-          aws s3api put-bucket-tagging --bucket "${BUCKET}" --tagging file:///tmp/new_tags.json
-          echo "Drift tag applied."
 
       - name: Terraform Init (uses remote S3 backend)
         run: terraform init -input=false
@@ -101,6 +59,7 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
           set -e
 
+      # --- Slack notification on drift (exit code 2) ---
       - name: Send Slack Notification if Drift Detected
         if: env.PLAN_EXIT == '2'
         env:
@@ -129,12 +88,27 @@ jobs:
                   { "type": "mrkdwn", "text": "*Run:*\n<${RUN_URL}|Open>" }
                 ]
               },
-              { "type": "section", "text": { "type": "mrkdwn", "text": "Approve remediation?" } },
+              {
+                "type": "section",
+                "text": { "type": "mrkdwn", "text": "Approve remediation?" }
+              },
               {
                 "type": "actions",
                 "elements": [
-                  { "type": "button", "text": { "type": "plain_text", "text": "Approve ✅" }, "style": "primary", "action_id": "approve_remediation", "value": "approve" },
-                  { "type": "button", "text": { "type": "plain_text", "text": "Reject ❌" }, "style": "danger", "action_id": "reject_remediation", "value": "reject" }
+                  {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Approve ✅" },
+                    "style": "primary",
+                    "action_id": "approve_remediation",
+                    "value": "approve"
+                  },
+                  {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Reject ❌" },
+                    "style": "danger",
+                    "action_id": "reject_remediation",
+                    "value": "reject"
+                  }
                 ]
               }
             ]
