@@ -2,7 +2,7 @@ name: Detect Terraform Drift
 
 on:
   schedule:
-    - cron: "*/30 * * * *"  # Every 30 minutes
+    - cron: "*/30 * * * *"
   push:
     paths:
       - 'terraform/**'
@@ -16,47 +16,112 @@ jobs:
       run:
         working-directory: terraform
 
+    env:
+      AWS_REGION: us-east-1                 # backend region
+      TF_IN_AUTOMATION: "true"
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+
+      # Authenticate to AWS (uses your existing key secrets)
+      # If you move to OIDC later, swap to role-to-assume.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Sanity check backend access (same bucket/table as backend.tf)
+      - name: Verify backend (S3 + DynamoDB)
+        run: |
+          aws s3 ls s3://tf-state-l00187927 >/dev/null
+          aws dynamodb describe-table --table-name terraform-locks --query 'Table.TableStatus' >/dev/null
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.5.0
 
-      - name: Terraform Init
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: terraform init
+      - name: Terraform Init (uses remote S3 backend)
+        run: terraform init -input=false
 
       - name: Terraform Plan for Drift Detection
         id: plan
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
           set +e
-          PLAN_OUTPUT=$(terraform plan -detailed-exitcode -out=tfplan.out 2>&1)
+          PLAN_OUTPUT=$(terraform plan -input=false -no-color -detailed-exitcode -out=tfplan.out 2>&1)
           PLAN_EXIT=$?
           echo "PLAN_EXIT=$PLAN_EXIT" >> $GITHUB_ENV
-          echo "--- TF PLAN OUTPUT ---"
-          echo "$PLAN_OUTPUT"
-          echo "--- END ---"
+          echo "PLAN_OUTPUT<<EOF" >> $GITHUB_ENV
+          echo "$PLAN_OUTPUT" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
           set -e
 
-      - name: Check for Drift
+      # --- Slack notification on drift (exit code 2) ---
+      - name: Send Slack Notification if Drift Detected
+        if: env.PLAN_EXIT == '2'
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
         run: |
-          echo "Terraform plan exit code: $PLAN_EXIT"
-          if [[ "$PLAN_EXIT" == "2" ]]; then
-            echo "⚠️ Drift detected!"
-            echo "DriftOutput<<EOF" >> $GITHUB_OUTPUT
-            terraform show -no-color tfplan.out >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
-          elif [[ "$PLAN_EXIT" == "0" ]]; then
-            echo "✅ No drift detected."
+          cat > payload.json <<'JSON'
+          {
+            "channel": "${SLACK_CHANNEL_ID}",
+            "text": "⚠️ Terraform drift detected. Approve remediation?",
+            "blocks": [
+              {
+                "type": "header",
+                "text": { "type": "plain_text", "text": "⚠️ Drift detected", "emoji": true }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  { "type": "mrkdwn", "text": "*Repo:*\n${REPO}" },
+                  { "type": "mrkdwn", "text": "*Branch:*\n${BRANCH}" },
+                  { "type": "mrkdwn", "text": "*Commit:*\n\`${SHA}\`" },
+                  { "type": "mrkdwn", "text": "*Run:*\n<${RUN_URL}|Open>" }
+                ]
+              },
+              {
+                "type": "section",
+                "text": { "type": "mrkdwn", "text": "Approve remediation?" }
+              },
+              {
+                "type": "actions",
+                "elements": [
+                  {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Approve ✅" },
+                    "style": "primary",
+                    "action_id": "approve_remediation",
+                    "value": "approve"
+                  },
+                  {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Reject ❌" },
+                    "style": "danger",
+                    "action_id": "reject_remediation",
+                    "value": "reject"
+                  }
+                ]
+              }
+            ]
+          }
+          JSON
+
+          curl -sS -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-type: application/json; charset=utf-8" \
+            --data @payload.json | tee /tmp/slack_response.json
+
+          if command -v jq >/dev/null 2>&1; then
+            jq -e '.ok == true' /tmp/slack_response.json > /dev/null
           else
-            echo "❌ Error during terraform plan"
-            exit 1
+            echo "jq not found; skipping ok-check"
           fi
