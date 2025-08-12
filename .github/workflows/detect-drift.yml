@@ -5,7 +5,7 @@ on:
     - cron: "*/30 * * * *"
   push:
     paths:
-      - 'terraform/**'
+      - "terraform/**"
   workflow_dispatch:
 
 jobs:
@@ -17,15 +17,13 @@ jobs:
         working-directory: terraform
 
     env:
-      AWS_REGION: us-east-1                 # backend region
+      AWS_REGION: us-east-1
       TF_IN_AUTOMATION: "true"
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      # Authenticate to AWS (uses your existing key secrets)
-      # If you move to OIDC later, swap to role-to-assume.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -33,7 +31,6 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Sanity check backend access (same bucket/table as backend.tf)
       - name: Verify backend (S3 + DynamoDB)
         run: |
           aws s3 ls s3://tf-state-l00187927 >/dev/null
@@ -51,15 +48,15 @@ jobs:
         id: plan
         run: |
           set +e
-          PLAN_OUTPUT=$(terraform plan -input=false -no-color -detailed-exitcode -out=tfplan.out 2>&1)
-          PLAN_EXIT=$?
+          terraform plan -input=false -no-color -detailed-exitcode -out=tfplan.out 2>&1 | tee /tmp/plan.log
+          PLAN_EXIT=${PIPESTATUS[0]}
           echo "PLAN_EXIT=$PLAN_EXIT" >> $GITHUB_ENV
-          echo "PLAN_OUTPUT<<EOF" >> $GITHUB_ENV
-          echo "$PLAN_OUTPUT" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+          # Try to extract the classic 'Plan: A to add, B to change, C to destroy.' line
+          PLAN_SUMMARY="$(terraform show -no-color tfplan.out | grep -E '^Plan:' | head -n1 || true)"
+          echo "PLAN_SUMMARY=$PLAN_SUMMARY" >> $GITHUB_ENV
           set -e
 
-      # --- Slack notification on drift (exit code 2) ---
+      # ---- Slack notification on drift (exit code 2) ----
       - name: Send Slack Notification if Drift Detected
         if: env.PLAN_EXIT == '2'
         env:
@@ -69,16 +66,25 @@ jobs:
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
+          PLAN_SUMMARY: ${{ env.PLAN_SUMMARY }}
         run: |
-          cat > payload.json <<'JSON'
+          set -e
+
+          # Correlation payload the Flask handler can decode (base64 JSON in button "value")
+          META=$(jq -n --arg run_id "${GITHUB_RUN_ID}" \
+                      --arg repo "${REPO}" \
+                      --arg sha "${SHA}" \
+                      --arg branch "${BRANCH}" \
+                      --arg run_url "${RUN_URL}" \
+                      '{run_id:$run_id, repo:$repo, sha:$sha, branch:$branch, run_url:$run_url}' \
+                  | base64 | tr -d '\n')
+
+          cat > payload.json <<JSON
           {
             "channel": "${SLACK_CHANNEL_ID}",
             "text": "⚠️ Terraform drift detected. Approve remediation?",
             "blocks": [
-              {
-                "type": "header",
-                "text": { "type": "plain_text", "text": "⚠️ Drift detected", "emoji": true }
-              },
+              { "type": "header", "text": { "type": "plain_text", "text": "⚠️ Drift detected", "emoji": true } },
               {
                 "type": "section",
                 "fields": [
@@ -90,7 +96,7 @@ jobs:
               },
               {
                 "type": "section",
-                "text": { "type": "mrkdwn", "text": "Approve remediation?" }
+                "text": { "type": "mrkdwn", "text": "${PLAN_SUMMARY:-Plan details unavailable}" }
               },
               {
                 "type": "actions",
@@ -100,14 +106,14 @@ jobs:
                     "text": { "type": "plain_text", "text": "Approve ✅" },
                     "style": "primary",
                     "action_id": "approve_remediation",
-                    "value": "approve"
+                    "value": "approve:${META}"
                   },
                   {
                     "type": "button",
                     "text": { "type": "plain_text", "text": "Reject ❌" },
                     "style": "danger",
                     "action_id": "reject_remediation",
-                    "value": "reject"
+                    "value": "reject:${META}"
                   }
                 ]
               }
@@ -115,13 +121,20 @@ jobs:
           }
           JSON
 
-          curl -sS -X POST https://slack.com/api/chat.postMessage \
+          RESP=$(curl -sS -X POST https://slack.com/api/chat.postMessage \
             -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
             -H "Content-type: application/json; charset=utf-8" \
-            --data @payload.json | tee /tmp/slack_response.json
+            --data @payload.json)
 
-          if command -v jq >/dev/null 2>&1; then
-            jq -e '.ok == true' /tmp/slack_response.json > /dev/null
-          else
-            echo "jq not found; skipping ok-check"
-          fi
+          echo "$RESP" | jq . || true
+          echo "$RESP" | jq -e '.ok == true' >/dev/null
+
+      # Optional: upload plan details for later inspection when drift occurs
+      - name: Upload plan artifact
+        if: env.PLAN_EXIT == '2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-and-log
+          path: |
+            terraform/tfplan.out
+            /tmp/plan.log
