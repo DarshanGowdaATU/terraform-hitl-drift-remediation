@@ -51,14 +51,13 @@ jobs:
           terraform plan -input=false -no-color -detailed-exitcode -out=tfplan.out 2>&1 | tee /tmp/plan.log
           PLAN_EXIT=${PIPESTATUS[0]}
           echo "PLAN_EXIT=$PLAN_EXIT" >> $GITHUB_ENV
-          # Try to extract the classic 'Plan: A to add, B to change, C to destroy.' line
-          PLAN_SUMMARY="$(terraform show -no-color tfplan.out | grep -E '^Plan:' | head -n1 || true)"
+          # Try to extract "Plan: X to add, Y to change, Z to destroy."
+          PLAN_SUMMARY="$(terraform show -no-color tfplan.out 2>/dev/null | grep -E '^Plan:' | head -n1 || true)"
           echo "PLAN_SUMMARY=$PLAN_SUMMARY" >> $GITHUB_ENV
           set -e
 
-      # ---- Slack notification on drift (exit code 2) ----
-      - name: Send Slack Notification if Drift Detected
-        if: env.PLAN_EXIT == '2'
+      # -------- Slack notification for ALL outcomes (buttons only on drift=2) --------
+      - name: Slack notify (all outcomes)
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
@@ -70,53 +69,63 @@ jobs:
         run: |
           set -e
 
-          # Correlation payload the Flask handler can decode (base64 JSON in button "value")
-          META=$(jq -n --arg run_id "${GITHUB_RUN_ID}" \
-                      --arg repo "${REPO}" \
-                      --arg sha "${SHA}" \
-                      --arg branch "${BRANCH}" \
-                      --arg run_url "${RUN_URL}" \
-                      '{run_id:$run_id, repo:$repo, sha:$sha, branch:$branch, run_url:$run_url}' \
-                  | base64 | tr -d '\n')
+          case "${PLAN_EXIT}" in
+            0) STATUS="✅ No drift";   HEADER="No drift";        PROMPT="No changes detected.";;
+            1) STATUS="❌ Plan error"; HEADER="Plan error";      PROMPT="Terraform plan failed. See logs and run link below.";;
+            2) STATUS="⚠️ Drift detected"; HEADER="Drift detected"; PROMPT="Approve remediation?";;
+            *) STATUS="❓ Unknown";    HEADER="Unknown result";  PROMPT="PLAN_EXIT=${PLAN_EXIT}";;
+          esac
+
+          # Optional actions (only when drift=2)
+          ACTIONS_BLOCK=""
+          if [ "${PLAN_EXIT}" = "2" ]; then
+            META=$(jq -n --arg run_id "${GITHUB_RUN_ID}" \
+                        --arg repo "${REPO}" \
+                        --arg sha "${SHA}" \
+                        --arg branch "${BRANCH}" \
+                        --arg run_url "${RUN_URL}" \
+                        '{run_id:$run_id, repo:$repo, sha:$sha, branch:$branch, run_url:$run_url}' \
+                    | base64 | tr -d '\n')
+            ACTIONS_BLOCK=$(cat <<EOB
+        ,
+        {
+          "type": "actions",
+          "elements": [
+            { "type": "button", "text": { "type": "plain_text", "text": "Approve ✅" }, "style": "primary", "action_id": "approve_remediation", "value": "approve:${META}" },
+            { "type": "button", "text": { "type": "plain_text", "text": "Reject ❌"  }, "style": "danger",  "action_id": "reject_remediation",  "value": "reject:${META}"  }
+          ]
+        }
+EOB
+)
+          fi
+
+          # Short error snippet (only on plan failure)
+          EXTRA_BLOCK=""
+          if [ "${PLAN_EXIT}" = "1" ]; then
+            SNIPPET=$(head -n 60 /tmp/plan.log | sed 's/"/\\"/g')
+            EXTRA_BLOCK=", { \"type\":\"section\", \"text\": { \"type\":\"mrkdwn\", \"text\": \"\`\`\`${SNIPPET}\`\`\`\" } }"
+          fi
 
           cat > payload.json <<JSON
           {
             "channel": "${SLACK_CHANNEL_ID}",
-            "text": "⚠️ Terraform drift detected. Approve remediation?",
+            "text": "${STATUS}",
             "blocks": [
-              { "type": "header", "text": { "type": "plain_text", "text": "⚠️ Drift detected", "emoji": true } },
+              { "type": "header", "text": { "type": "plain_text", "text": "${HEADER}", "emoji": true } },
+              {
+                "type": "section",
+                "text": { "type": "mrkdwn", "text": "${PROMPT}" }
+              },
               {
                 "type": "section",
                 "fields": [
-                  { "type": "mrkdwn", "text": "*Repo:*\n${REPO}" },
-                  { "type": "mrkdwn", "text": "*Branch:*\n${BRANCH}" },
-                  { "type": "mrkdwn", "text": "*Commit:*\n\`${SHA}\`" },
-                  { "type": "mrkdwn", "text": "*Run:*\n<${RUN_URL}|Open>" }
+                  { "type": "mrkdwn", "text": "*Repo:*\\n${REPO}" },
+                  { "type": "mrkdwn", "text": "*Branch:*\\n${BRANCH}" },
+                  { "type": "mrkdwn", "text": "*Commit:*\\n\`${SHA}\`" },
+                  { "type": "mrkdwn", "text": "*Run:*\\n<${RUN_URL}|Open>" },
+                  { "type": "mrkdwn", "text": "*Plan:*\\n${PLAN_SUMMARY:-n/a}" }
                 ]
-              },
-              {
-                "type": "section",
-                "text": { "type": "mrkdwn", "text": "${PLAN_SUMMARY:-Plan details unavailable}" }
-              },
-              {
-                "type": "actions",
-                "elements": [
-                  {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "Approve ✅" },
-                    "style": "primary",
-                    "action_id": "approve_remediation",
-                    "value": "approve:${META}"
-                  },
-                  {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "Reject ❌" },
-                    "style": "danger",
-                    "action_id": "reject_remediation",
-                    "value": "reject:${META}"
-                  }
-                ]
-              }
+              }${ACTIONS_BLOCK}${EXTRA_BLOCK}
             ]
           }
           JSON
@@ -129,9 +138,8 @@ jobs:
           echo "$RESP" | jq . || true
           echo "$RESP" | jq -e '.ok == true' >/dev/null
 
-      # Optional: upload plan details for later inspection when drift occurs
       - name: Upload plan artifact
-        if: env.PLAN_EXIT == '2'
+        if: env.PLAN_EXIT == '1' || env.PLAN_EXIT == '2'
         uses: actions/upload-artifact@v4
         with:
           name: tfplan-and-log
