@@ -56,6 +56,7 @@ jobs:
           echo "PLAN_SUMMARY=$PLAN_SUMMARY" >> $GITHUB_ENV
           set -e
 
+      # -------- Slack notification for ALL outcomes (buttons only on drift=2) --------
       - name: Slack notify (all outcomes)
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
