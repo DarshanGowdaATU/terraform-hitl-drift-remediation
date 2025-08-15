@@ -61,7 +61,6 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
           set -e
 
-      # Show what happened and add a concise summary to the job
       - name: Show plan result
         if: always()
         run: |
@@ -77,25 +76,14 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Fail fast on plan errors (exit code 1)
       - name: Fail on plan error
         if: env.PLAN_EXIT == '1'
         run: |
           echo "Terraform plan failed (exit 1). See logs above." >&2
           exit 1
 
-      # For manual testing only: allow forcing Slack without real drift
-      - name: Debug dispatch input
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: echo "force_slack=${{ github.event.inputs.force_slack }}"
-
-      - name: Force Slack for testing
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true' }}
-        run: echo "PLAN_EXIT=2" >> $GITHUB_ENV
-
-      # Send Slack only when drift is detected (or forced during manual test)
       - name: Send Slack Notification if Drift Detected
-        if: env.PLAN_EXIT == '2'
+        if: env.PLAN_EXIT == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true')
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
