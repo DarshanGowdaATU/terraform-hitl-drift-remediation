@@ -7,6 +7,11 @@ on:
     paths:
       - 'terraform/**'
   workflow_dispatch:
+    inputs:
+      force_slack:
+        type: boolean
+        default: false
+        description: "Post to Slack even without drift (manual runs only)"
 
 jobs:
   detect-drift:
@@ -17,15 +22,13 @@ jobs:
         working-directory: terraform
 
     env:
-      AWS_REGION: us-east-1                 # backend region
+      AWS_REGION: us-east-1
       TF_IN_AUTOMATION: "true"
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      # Authenticate to AWS (uses your existing key secrets)
-      # If you move to OIDC later, swap to role-to-assume.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -33,7 +36,6 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Sanity check backend access (same bucket/table as backend.tf)
       - name: Verify backend (S3 + DynamoDB)
         run: |
           aws s3 ls s3://tf-state-l00187927 >/dev/null
@@ -58,12 +60,8 @@ jobs:
           echo "$PLAN_OUTPUT" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           set -e
-          
-      - name: Force Slack for testing
-        if: ${{ inputs.force_slack }}
-        run: echo "PLAN_EXIT=2" >> $GITHUB_ENV
 
-      # 1) Always show the exit code and a short log
+      # Show what happened and add a concise summary to the job
       - name: Show plan result
         if: always()
         run: |
@@ -79,14 +77,23 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 2) Fail the job on plan errors (exit 1)
+      # Fail fast on plan errors (exit code 1)
       - name: Fail on plan error
         if: env.PLAN_EXIT == '1'
         run: |
           echo "Terraform plan failed (exit 1). See logs above." >&2
           exit 1
 
-      # --- Slack notification on drift (exit code 2) ---
+      # For manual testing only: allow forcing Slack without real drift
+      - name: Debug dispatch input
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: echo "force_slack=${{ github.event.inputs.force_slack }}"
+
+      - name: Force Slack for testing
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true' }}
+        run: echo "PLAN_EXIT=2" >> $GITHUB_ENV
+
+      # Send Slack only when drift is detected (or forced during manual test)
       - name: Send Slack Notification if Drift Detected
         if: env.PLAN_EXIT == '2'
         env:
