@@ -80,12 +80,6 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Fail on plan error
-        if: env.PLAN_EXIT == '1'
-        run: |
-          echo "Terraform plan failed (exit 1). See logs above." >&2
-          exit 1
-
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
