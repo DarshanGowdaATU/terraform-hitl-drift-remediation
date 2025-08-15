@@ -58,6 +58,33 @@ jobs:
           echo "$PLAN_OUTPUT" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           set -e
+          
+      - name: Force Slack for testing
+        if: ${{ inputs.force_slack }}
+        run: echo "PLAN_EXIT=2" >> $GITHUB_ENV
+
+      # 1) Always show the exit code and a short log
+      - name: Show plan result
+        if: always()
+        run: |
+          echo "PLAN_EXIT=${PLAN_EXIT:-unset}"
+          printf "%s\n" "${PLAN_OUTPUT:-no output captured}" | tail -n 200
+          {
+            echo "### Terraform plan"
+            echo "- Exit code: ${PLAN_EXIT:-unset}"
+            echo ""
+            echo "Last 200 lines:"
+            echo '```'
+            printf "%s\n" "${PLAN_OUTPUT:-no output captured}" | tail -n 200
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 2) Fail the job on plan errors (exit 1)
+      - name: Fail on plan error
+        if: env.PLAN_EXIT == '1'
+        run: |
+          echo "Terraform plan failed (exit 1). See logs above." >&2
+          exit 1
 
       # --- Slack notification on drift (exit code 2) ---
       - name: Send Slack Notification if Drift Detected
