@@ -38,16 +38,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Prefer OIDC; fall back to access keys if no role is provided
-      - name: Configure AWS credentials (OIDC)
-        if: ${{ secrets.AWS_ROLE_TO_ASSUME != '' }}
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ env.AWS_REGION }}
-
       - name: Configure AWS credentials (access keys)
-        if: ${{ secrets.AWS_ROLE_TO_ASSUME == '' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -72,41 +63,76 @@ jobs:
       - name: Terraform Init (uses remote S3 backend)
         run: terraform init -input=false
 
-      # --- DRIFT-FOCUSED PLAN: refresh-only to detect real-world drift ---
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # ---------- DRIFT FIRST: refresh-only ----------
       - name: Terraform Plan (refresh-only for drift)
         id: refresh_plan
         run: |
+          set -euo pipefail
           set +e
           terraform plan -refresh-only -input=false -no-color -detailed-exitcode -out=tfplan-refresh.out | tee plan-refresh.txt
           RC=${PIPESTATUS[0]}
-          echo "plan_exit=$RC" >> "$GITHUB_OUTPUT"
+          echo "exit=$RC" >> "$GITHUB_OUTPUT"
           set -e
 
-      # --- Normal plan only when no drift is detected ---
+      - name: Evaluate refresh-only plan JSON
+        id: refresh_eval
+        run: |
+          set -euo pipefail
+          terraform show -json tfplan-refresh.out > plan-refresh.json
+          HAS_CHANGES=$(jq -r '
+            ([.resource_changes[]?.change.actions[]] | length) as $n
+            | if $n > 0 then "true" else "false" end
+          ' plan-refresh.json)
+          echo "has_changes=$HAS_CHANGES" >> "$GITHUB_OUTPUT"
+
+      # ---------- Normal plan (only if no drift) ----------
       - name: Terraform Plan (normal, only if no drift)
         id: normal_plan
-        if: steps.refresh_plan.outputs.plan_exit != '2'
+        if: ${{ steps.refresh_eval.outputs.has_changes != 'true' }}
         run: |
+          set -euo pipefail
           set +e
           terraform plan -input=false -no-color -detailed-exitcode -out=tfplan.out | tee plan.txt
           RC=${PIPESTATUS[0]}
-          echo "plan_exit=$RC" >> "$GITHUB_OUTPUT"
+          echo "exit=$RC" >> "$GITHUB_OUTPUT"
           set -e
 
-      - name: Add plan tail(s) to summary
+      - name: Evaluate normal plan JSON
+        id: normal_eval
+        if: ${{ steps.refresh_eval.outputs.has_changes != 'true' }}
+        run: |
+          set -euo pipefail
+          terraform show -json tfplan.out > plan.json
+          HAS_CHANGES=$(jq -r '
+            ([.resource_changes[]?.change.actions[]] | length) as $n
+            | if $n > 0 then "true" else "false" end
+          ' plan.json)
+          echo "has_changes=$HAS_CHANGES" >> "$GITHUB_OUTPUT"
+
+      - name: Add plan summaries
         if: always()
+        env:
+          REFRESH_EXIT: ${{ steps.refresh_plan.outputs.exit }}
+          REFRESH_HAS_CHANGES: ${{ steps.refresh_eval.outputs.has_changes }}
+          NORMAL_EXIT: ${{ steps.normal_plan.outputs.exit }}
+          NORMAL_HAS_CHANGES: ${{ steps.normal_eval.outputs.has_changes }}
         run: |
           {
-            echo "### Terraform plan (refresh-only)"
-            echo "- Exit code: ${{ steps.refresh_plan.outputs.plan_exit || 'unset' }}"
+            echo "## Terraform plan (refresh-only)"
+            echo "- Detailed exit code: ${REFRESH_EXIT:-unset}"
+            echo "- Has drift (from JSON): ${REFRESH_HAS_CHANGES:-unknown}"
             echo ""
             echo "Last 200 lines:"
             echo '```'
             tail -n 200 plan-refresh.txt || true
             echo '```'
             echo ""
-            echo "### Terraform plan (normal)"
-            echo "- Exit code: ${{ steps.normal_plan.outputs.plan_exit || 'skipped' }}"
+            echo "## Terraform plan (normal)"
+            echo "- Detailed exit code: ${NORMAL_EXIT:-skipped}"
+            echo "- Has changes (from JSON): ${NORMAL_HAS_CHANGES:-skipped}"
             echo ""
             echo "Last 200 lines:"
             echo '```'
@@ -121,18 +147,18 @@ jobs:
           name: terraform-plans-${{ github.run_id }}
           path: |
             terraform/plan-refresh.txt
-            terraform/plan.txt
+            terraform/plan-refresh.json
             terraform/tfplan-refresh.out
+            terraform/plan.txt
+            terraform/plan.json
             terraform/tfplan.out
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
+      # ---------- Notify only on DRIFT (refresh-only) or manual force ----------
       - name: Send Slack if DRIFT detected
         id: slack_message
-        if: steps.refresh_plan.outputs.plan_exit == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true')
+        if: ${{ steps.refresh_eval.outputs.has_changes == 'true' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true') }}
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
@@ -149,7 +175,7 @@ jobs:
             --arg run_url "$RUN_URL" \
             '{
               channel: $channel,
-              text: "⚠️ Terraform drift detected (refresh-only plan). Approve remediation?",
+              text: "⚠️ Terraform drift detected (refresh-only). Approve remediation?",
               blocks: [
                 { "type": "header", "text": { "type": "plain_text", "text": "⚠️ Drift detected", "emoji": true } },
                 { "type": "section", "fields": [
@@ -175,7 +201,7 @@ jobs:
           echo "ts=$(jq -r '.ts' /tmp/slack_response.json)" >> "$GITHUB_OUTPUT"
 
       - name: Attach refresh-only plan to Slack thread
-        if: steps.slack_message.outputs.ts != ''
+        if: ${{ steps.slack_message.outputs.ts != '' }}
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
