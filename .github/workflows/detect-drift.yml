@@ -39,18 +39,18 @@ jobs:
       - name: Verify backend (S3 + DynamoDB)
         run: |
           aws s3 ls s3://tf-state-l00187927 >/dev/null
-          aws dynamodb describe-table --table-name terraform-locks --query 'Table.TableStatus' >/dev/null
+          aws dynamodb describe-table --table-name terraform-locks --query 'Table.TableStatus' >/devnull 2>&1
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.5.0
-          terraform_wrapper: false   # <- important: get real -detailed-exitcode
+          terraform_wrapper: false   # critical: get real -detailed-exitcode
 
       - name: Terraform Init (uses remote S3 backend)
         run: terraform init -input=false
 
-      # --- Plan: capture real exit code and full output ---
+      # Capture real exit code and plan output
       - name: Terraform Plan for Drift Detection
         id: plan
         run: |
@@ -83,6 +83,64 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
+      # Build attribute-level diffs for Slack (top 30 resources, top 12 attrs each)
+      - name: Summarize drift (details for Slack)
+        if: env.PLAN_EXIT == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true')
+        run: |
+          terraform show -json tfplan.out > plan.json || echo '{}' > plan.json
+
+          {
+            echo "DRIFT_DETAILS<<EOF"
+            jq -r '
+              def action(a):
+                if a==["create"] then "add"
+                elif a==["update"] then "change"
+                elif a==["delete"] then "destroy"
+                elif (a|sort)==["create","delete"] then "replace"
+                else (a|join("+"))
+                end;
+
+              def pathstr(p): p | map(tostring) | join(".");
+
+              (.resource_changes // [])
+              | map(
+                  . as $rc
+                  | $rc.change as $ch
+                  | ($ch.before // {} ) as $before
+                  | ($ch.after  // {} ) as $after
+                  | ($ch.after_unknown // {} ) as $unk
+                  | ( (($before|paths(scalars)) + ($after|paths(scalars))) | unique ) as $paths
+                  | {
+                      address: $rc.address,
+                      act: action($ch.actions),
+                      diffs: (
+                        $paths
+                        | map({
+                            k: (pathstr(.)),
+                            b: (try $before|getpath(.) catch null),
+                            a: (try $after|getpath(.)  catch null),
+                            u: (try $unk|getpath(.)    catch false)
+                          })
+                        | map(select(.b != .a and (.u|not)))
+                        # hide noisy/ephemeral fields
+                        | map(select(.k|test("(^|\\.)id$|(^|\\.)arn$|(^|\\.)owner_id$|(^|\\.)tags_all(\\.|$)|(^|\\.)create_date$|(^|\\.)modification_date$"; "i")|not))
+                        | .[0:12]
+                      )
+                    }
+                )
+              | map(
+                  if (.act=="add" or .act=="destroy") and (.diffs|length==0)
+                    then "*\(.address)* — \(.act)"
+                    else (["*\(.address)* — \(.act)"] + (.diffs | map("• `\(.k)`: `\(.b)` → `\(.a)`"))) | join("\n")
+                  end
+                )
+              | .[0:30]
+              | (if length==0 then "No resource changes." else join("\n\n") end)
+            ' plan.json | head -c 2800
+            echo
+            echo "EOF"
+          } >> $GITHUB_ENV
+
       - name: Send Slack Notification if Drift Detected
         if: env.PLAN_EXIT == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true')
         env:
@@ -99,8 +157,7 @@ jobs:
             --arg branch "$BRANCH" \
             --arg sha "$SHA" \
             --arg run_url "$RUN_URL" \
-            --arg summary "$DRIFT_SUMMARY" \
-            --arg changes "$DRIFT_LIST" \
+            --arg details "$DRIFT_DETAILS" \
             '{
               channel: $channel,
               text: "⚠️ Terraform drift detected. Approve remediation?",
@@ -112,8 +169,7 @@ jobs:
                   { "type": "mrkdwn", "text": "*Commit:*\n`\($sha)`" },
                   { "type": "mrkdwn", "text": "*Run:*\n<\($run_url)|Open>" }
                 ]},
-                { "type": "section", "text": { "type": "mrkdwn", "text": "*Summary:*\n\($summary)" } },
-                { "type": "section", "text": { "type": "mrkdwn", "text": "*Changes (top 30):*\n\($changes)" } },
+                { "type": "section", "text": { "type": "mrkdwn", "text": "*What changed:*\n\($details)" } },
                 { "type": "divider" },
                 { "type": "section", "text": { "type": "mrkdwn", "text": "Approve remediation?" } },
                 { "type": "actions", "elements": [
