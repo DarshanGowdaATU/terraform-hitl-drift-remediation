@@ -83,71 +83,88 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      # Build attribute-level diffs for Slack (before → after), safely truncated
+      # Build attribute-level diffs for Slack (before → after), with safe jq + text fallback
       - name: Summarize drift (details for Slack)
         if: env.PLAN_EXIT == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true')
         run: |
+          set +e
           terraform show -json tfplan.out > plan.json || echo '{}' > plan.json
+
+          # --- JSON diff (safe even if no scalar paths) ---
+          jq -r '
+            def action(a):
+              if a==["create"] then "add"
+              elif a==["update"] then "change"
+              elif a==["delete"] then "destroy"
+              elif (a|sort)==["create","delete"] then "replace"
+              else (a|join("+"))
+              end;
+
+            def pathstr(p): p | map(tostring) | join(".");
+
+            (.resource_changes // [])
+            | (if length==0 then
+                 ["No resource changes."]
+               else
+                 map(
+                   . as $rc
+                   | $rc.change as $ch
+                   | ($ch.before // {} ) as $before
+                   | ($ch.after  // {} ) as $after
+                   | ($ch.after_unknown // {} ) as $unk
+                   # collect scalar paths; guard empty with add? // []
+                   | ( ( [ $before | paths(scalars) ] + [ $after | paths(scalars) ] ) | add? // [] | unique ) as $paths
+                   | {
+                       address: $rc.address,
+                       act: action($ch.actions),
+                       diffs: (
+                         $paths
+                         | map({
+                             k: (pathstr(.)),
+                             b: (try ($before|getpath(.)) catch null),
+                             a: (try ($after|getpath(.))  catch null),
+                             u: (try ($unk|getpath(.))    catch false)
+                           })
+                         | map(select(.b != .a and (.u|not)))
+                         # hide noisy/ephemeral fields
+                         | map(select(.k|test("(^|\\.)id$|(^|\\.)arn$|(^|\\.)owner_id$|(^|\\.)tags_all(\\.|$)|(^|\\.)create_date$|(^|\\.)modification_date$"; "i")|not))
+                         | .[0:12]
+                       )
+                     }
+                 )
+                 | map(
+                     if (.act=="add" or .act=="destroy") and (.diffs|length==0)
+                       then "*\(.address)* — \(.act)"
+                       else (["*\(.address)* — \(.act)"] + (.diffs | map("- `\(.k)`: `\(.b)` → `\(.a)`"))) | join("\n")
+                     end
+                   )
+                 | .[0:30]
+               end)
+            | join("\n\n")
+          ' plan.json \
+          | awk 'BEGIN{max=2800;len=0}
+                 { l=length($0)+1; if (len+l>max){ print "..."; exit } print; len+=l }' \
+          > /tmp/details.txt
+
+          # --- Fallback: parse human-readable plan text if JSON produced nothing ---
+          if [ ! -s /tmp/details.txt ]; then
+            terraform show -no-color tfplan.out > plan.human || true
+            sed -n "/Terraform will perform the following actions:/,\$p" plan.human \
+            | sed -E "s/^[[:space:]]*# (.*)/*\\1*/; s/^[[:space:]]*[~+-] (.*)$/- \\1/; s/^[[:space:]]{2}([A-Za-z0-9_.-]+):/  - \\1:/" \
+            | sed -n '1,120p' \
+            | awk 'BEGIN{max=2800;len=0}
+                   { l=length($0)+1; if (len+l>max){ print "..."; exit } print; len+=l }' \
+            > /tmp/details.txt
+            [ -s /tmp/details.txt ] || echo "(no diff lines produced)" > /tmp/details.txt
+          fi
 
           {
             echo "DRIFT_DETAILS<<EOF"
-            jq -r '
-              def action(a):
-                if a==["create"] then "add"
-                elif a==["update"] then "change"
-                elif a==["delete"] then "destroy"
-                elif (a|sort)==["create","delete"] then "replace"
-                else (a|join("+"))
-                end;
-
-              def pathstr(p): p | map(tostring) | join(".");
-
-              (.resource_changes // [])
-              | (if length==0 then
-                   ["No resource changes."]
-                 else
-                   map(
-                     . as $rc
-                     | $rc.change as $ch
-                     | ($ch.before // {} ) as $before
-                     | ($ch.after  // {} ) as $after
-                     | ($ch.after_unknown // {} ) as $unk
-                     # paths(scalars) emits a stream; collect to arrays first, then combine
-                     | ( ( [ $before | paths(scalars) ] + [ $after | paths(scalars) ] ) | add | unique ) as $paths
-                     | {
-                         address: $rc.address,
-                         act: action($ch.actions),
-                         diffs: (
-                           $paths
-                           | map({
-                               k: (pathstr(.)),
-                               b: (try ($before|getpath(.)) catch null),
-                               a: (try ($after|getpath(.))  catch null),
-                               u: (try ($unk|getpath(.))    catch false)
-                             })
-                           | map(select(.b != .a and (.u|not)))
-                           # hide noisy/ephemeral fields
-                           | map(select(.k|test("(^|\\.)id$|(^|\\.)arn$|(^|\\.)owner_id$|(^|\\.)tags_all(\\.|$)|(^|\\.)create_date$|(^|\\.)modification_date$"; "i")|not))
-                           | .[0:12]
-                         )
-                       }
-                   )
-                   | map(
-                       if (.act=="add" or .act=="destroy") and (.diffs|length==0)
-                         then "*\(.address)* — \(.act)"
-                         else (["*\(.address)* — \(.act)"] + (.diffs | map("- `\(.k)`: `\(.b)` → `\(.a)`"))) | join("\n")
-                       end
-                     )
-                   | .[0:30]
-                 end)
-              | join("\n\n")
-            ' plan.json \
-            | awk 'BEGIN{max=2800;len=0}
-                   { l=length($0)+1; if (len+l>max){ print "..."; exit } print; len+=l }
-                   END{ if (NR==0) print "(no diff lines produced)" }'
+            cat /tmp/details.txt
             echo
             echo "EOF"
           } >> $GITHUB_ENV
+          set -e
 
       - name: Send Slack Notification if Drift Detected
         if: env.PLAN_EXIT == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true')
