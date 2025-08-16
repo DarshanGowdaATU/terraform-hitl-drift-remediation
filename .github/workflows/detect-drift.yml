@@ -45,16 +45,16 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.5.0
+          terraform_wrapper: false   # <- important: get real -detailed-exitcode
 
       - name: Terraform Init (uses remote S3 backend)
         run: terraform init -input=false
 
-      # --- FIXED PLAN STEP: capture real exit code and full output ---
+      # --- Plan: capture real exit code and full output ---
       - name: Terraform Plan for Drift Detection
         id: plan
         run: |
           set +e
-          # Write human-readable plan to plan.txt and a binary planfile to tfplan.out
           terraform plan -input=false -no-color -detailed-exitcode -out=tfplan.out | tee plan.txt
           PLAN_EXIT=${PIPESTATUS[0]}
           echo "PLAN_EXIT=$PLAN_EXIT" >> $GITHUB_ENV
@@ -83,6 +83,49 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
+      # Build a summary of changes for Slack (counts + top 30 resources)
+      - name: Summarize drift (JSON)
+        if: env.PLAN_EXIT == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true')
+        run: |
+          # Create JSON plan; if show fails for any reason, keep an empty JSON so jq doesn't break
+          terraform show -json tfplan.out > plan.json || echo '{}' > plan.json
+
+          # Counts summary (add | change | destroy | replace)
+          DRIFT_SUMMARY=$(jq -r '
+            def action(a):
+              if a==["create"] then "add"
+              elif a==["update"] then "change"
+              elif a==["delete"] then "destroy"
+              elif a==["delete","create"] or a==["create","delete"] then "replace"
+              else (a|join("+"))
+              end;
+            (.resource_changes // [])
+            | (reduce (.[]?.change.actions | action) as $k ({}; .[$k] = (.[ $k ] // 0) + 1))
+            | ["add","change","destroy","replace"]
+            | map("\(.): \((inputs)[. ] // 0)") as $o
+            | ($o[0] // "add: 0") + " | " + ($o[1] // "change: 0") + " | " + ($o[2] // "destroy: 0") + " | " + ($o[3] // "replace: 0")
+          ' plan.json plan.json plan.json plan.json plan.json)
+          echo "DRIFT_SUMMARY=${DRIFT_SUMMARY:-add: 0 | change: 0 | destroy: 0 | replace: 0}" >> $GITHUB_ENV
+
+          # Top 30 changed resources
+          {
+            echo "DRIFT_LIST<<EOF"
+            jq -r '
+              def action(a):
+                if a==["create"] then "add"
+                elif a==["update"] then "change"
+                elif a==["delete"] then "destroy"
+                elif a==["delete","create"] or a==["create","delete"] then "replace"
+                else (a|join("+"))
+                end;
+              (.resource_changes // [])
+              | [ .[] | "*\(.address)* — \(.change.actions | action)" ]
+              | .[0:30]
+              | if length==0 then "No resource changes." else join("\n") end
+            ' plan.json
+            echo "EOF"
+          } >> $GITHUB_ENV
+
       - name: Send Slack Notification if Drift Detected
         if: env.PLAN_EXIT == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true')
         env:
@@ -99,6 +142,8 @@ jobs:
             --arg branch "$BRANCH" \
             --arg sha "$SHA" \
             --arg run_url "$RUN_URL" \
+            --arg summary "$DRIFT_SUMMARY" \
+            --arg changes "$DRIFT_LIST" \
             '{
               channel: $channel,
               text: "⚠️ Terraform drift detected. Approve remediation?",
@@ -110,6 +155,9 @@ jobs:
                   { "type": "mrkdwn", "text": "*Commit:*\n`\($sha)`" },
                   { "type": "mrkdwn", "text": "*Run:*\n<\($run_url)|Open>" }
                 ]},
+                { "type": "section", "text": { "type": "mrkdwn", "text": "*Summary:*\n\($summary)" } },
+                { "type": "section", "text": { "type": "mrkdwn", "text": "*Changes (top 30):*\n\($changes)" } },
+                { "type": "divider" },
                 { "type": "section", "text": { "type": "mrkdwn", "text": "Approve remediation?" } },
                 { "type": "actions", "elements": [
                   { "type": "button", "text": { "type": "plain_text", "text": "Approve ✅" }, "style": "primary", "action_id": "approve_remediation", "value": "approve" },
