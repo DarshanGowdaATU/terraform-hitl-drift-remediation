@@ -33,6 +33,8 @@ jobs:
       TF_IN_AUTOMATION: "true"
       TF_STATE_BUCKET: tf-state-l00187927
       TF_LOCK_TABLE: terraform-locks
+      # Set to "true" if you ALSO want Slack alerts for output-only changes (e.g., public IP flips)
+      ALERT_ON_OUTPUT_CHANGES: "false"
 
     steps:
       - name: Checkout code
@@ -82,16 +84,22 @@ jobs:
         run: |
           set -euo pipefail
           terraform show -json tfplan-refresh.out > plan-refresh.json
-          HAS_CHANGES=$(jq -r '
-            ([.resource_changes[]?.change.actions[]] | length) as $n
+          HAS_RESOURCE_CHANGES=$(jq -r '
+            (.resource_changes // []) as $rc
+            | if ($rc | length) > 0 then "true" else "false" end
+          ' plan-refresh.json)
+          # outputs are not relevant for refresh-only; still compute for completeness
+          HAS_OUTPUTS=$(jq -r '
+            ((.output_changes // {}) | length) as $n
             | if $n > 0 then "true" else "false" end
           ' plan-refresh.json)
-          echo "has_changes=$HAS_CHANGES" >> "$GITHUB_OUTPUT"
+          echo "has_resource_changes=$HAS_RESOURCE_CHANGES" >> "$GITHUB_OUTPUT"
+          echo "has_output_changes=$HAS_OUTPUTS" >> "$GITHUB_OUTPUT"
 
-      # ---------- Normal plan (only if no drift) ----------
-      - name: Terraform Plan (normal, only if no drift)
+      # ---------- Normal plan (only if no refresh-only drift) ----------
+      - name: Terraform Plan (normal, only if no refresh drift)
         id: normal_plan
-        if: ${{ steps.refresh_eval.outputs.has_changes != 'true' }}
+        if: ${{ steps.refresh_plan.outputs.exit != '2' }}
         run: |
           set -euo pipefail
           set +e
@@ -102,28 +110,37 @@ jobs:
 
       - name: Evaluate normal plan JSON
         id: normal_eval
-        if: ${{ steps.refresh_eval.outputs.has_changes != 'true' }}
+        if: ${{ steps.refresh_plan.outputs.exit != '2' }}
         run: |
           set -euo pipefail
           terraform show -json tfplan.out > plan.json
-          HAS_CHANGES=$(jq -r '
-            ([.resource_changes[]?.change.actions[]] | length) as $n
+          HAS_RESOURCE_CHANGES=$(jq -r '
+            (.resource_changes // []) as $rc
+            | if ($rc | length) > 0 then "true" else "false" end
+          ' plan.json)
+          HAS_OUTPUTS=$(jq -r '
+            ((.output_changes // {}) | length) as $n
             | if $n > 0 then "true" else "false" end
           ' plan.json)
-          echo "has_changes=$HAS_CHANGES" >> "$GITHUB_OUTPUT"
+          echo "has_resource_changes=$HAS_RESOURCE_CHANGES" >> "$GITHUB_OUTPUT"
+          echo "has_output_changes=$HAS_OUTPUTS" >> "$GITHUB_OUTPUT"
 
+      # ---------- Summaries ----------
       - name: Add plan summaries
         if: always()
         env:
           REFRESH_EXIT: ${{ steps.refresh_plan.outputs.exit }}
-          REFRESH_HAS_CHANGES: ${{ steps.refresh_eval.outputs.has_changes }}
+          REFRESH_HAS_RES: ${{ steps.refresh_eval.outputs.has_resource_changes }}
+          REFRESH_HAS_OUT: ${{ steps.refresh_eval.outputs.has_output_changes }}
           NORMAL_EXIT: ${{ steps.normal_plan.outputs.exit }}
-          NORMAL_HAS_CHANGES: ${{ steps.normal_eval.outputs.has_changes }}
+          NORMAL_HAS_RES: ${{ steps.normal_eval.outputs.has_resource_changes }}
+          NORMAL_HAS_OUT: ${{ steps.normal_eval.outputs.has_output_changes }}
         run: |
           {
             echo "## Terraform plan (refresh-only)"
-            echo "- Detailed exit code: ${REFRESH_EXIT:-unset}"
-            echo "- Has drift (from JSON): ${REFRESH_HAS_CHANGES:-unknown}"
+            echo "- Exit code: ${REFRESH_EXIT:-unset}"
+            echo "- Resource changes (JSON): ${REFRESH_HAS_RES:-unknown}"
+            echo "- Output changes (JSON): ${REFRESH_HAS_OUT:-unknown}"
             echo ""
             echo "Last 200 lines:"
             echo '```'
@@ -131,8 +148,9 @@ jobs:
             echo '```'
             echo ""
             echo "## Terraform plan (normal)"
-            echo "- Detailed exit code: ${NORMAL_EXIT:-skipped}"
-            echo "- Has changes (from JSON): ${NORMAL_HAS_CHANGES:-skipped}"
+            echo "- Exit code: ${NORMAL_EXIT:-skipped}"
+            echo "- Resource changes (JSON): ${NORMAL_HAS_RES:-skipped}"
+            echo "- Output changes (JSON): ${NORMAL_HAS_OUT:-skipped}"
             echo ""
             echo "Last 200 lines:"
             echo '```'
@@ -155,10 +173,30 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      # ---------- Notify only on DRIFT (refresh-only) or manual force ----------
-      - name: Send Slack if DRIFT detected
+      # ---------- Decide whether to alert ----------
+      - name: Decide alert reason
+        id: decide
+        env:
+          REFRESH_EXIT: ${{ steps.refresh_plan.outputs.exit }}
+          NORMAL_EXIT: ${{ steps.normal_plan.outputs.exit }}
+          NORMAL_HAS_OUT: ${{ steps.normal_eval.outputs.has_output_changes }}
+          ALERT_ON_OUTPUT_CHANGES: ${{ env.ALERT_ON_OUTPUT_CHANGES }}
+        run: |
+          set -euo pipefail
+          REASON=""
+          if [ "${REFRESH_EXIT:-}" = "2" ]; then
+            REASON="drift (refresh-only)"
+          elif [ "${NORMAL_EXIT:-}" = "2" ]; then
+            REASON="config changes"
+          elif [ "${ALERT_ON_OUTPUT_CHANGES}" = "true" ] && [ "${NORMAL_HAS_OUT:-false}" = "true" ]; then
+            REASON="outputs changed"
+          fi
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+
+      # ---------- Notify on chosen condition or manual force ----------
+      - name: Send Slack
         id: slack_message
-        if: ${{ steps.refresh_eval.outputs.has_changes == 'true' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true') }}
+        if: ${{ steps.decide.outputs.reason != '' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true') }}
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
@@ -166,18 +204,21 @@ jobs:
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
+          REASON: ${{ steps.decide.outputs.reason }}
         run: |
+          MSG_REASON="${REASON:-manual trigger}"
           jq -n \
             --arg channel "$SLACK_CHANNEL_ID" \
             --arg repo "$REPO" \
             --arg branch "$BRANCH" \
             --arg sha "$SHA" \
             --arg run_url "$RUN_URL" \
+            --arg reason "$MSG_REASON" \
             '{
               channel: $channel,
-              text: "⚠️ Terraform drift detected (refresh-only). Approve remediation?",
+              text: ("⚠️ Terraform " + $reason + " detected. Approve remediation?"),
               blocks: [
-                { "type": "header", "text": { "type": "plain_text", "text": "⚠️ Drift detected", "emoji": true } },
+                { "type": "header", "text": { "type": "plain_text", "text": ("⚠️ " + $reason), "emoji": true } },
                 { "type": "section", "fields": [
                   { "type": "mrkdwn", "text": "*Repo:*\n\($repo)" },
                   { "type": "mrkdwn", "text": "*Branch:*\n\($branch)" },
