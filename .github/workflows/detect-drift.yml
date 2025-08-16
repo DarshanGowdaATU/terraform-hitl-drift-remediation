@@ -120,9 +120,9 @@ jobs:
                            $paths
                            | map({
                                k: (pathstr(.)),
-                               b: (try $before|getpath(.) catch null),
-                               a: (try $after|getpath(.)  catch null),
-                               u: (try $unk|getpath(.)    catch false)
+                               b: (try ($before|getpath(.)) catch null),
+                               a: (try ($after|getpath(.))  catch null),
+                               u: (try ($unk|getpath(.))    catch false)
                              })
                            | map(select(.b != .a and (.u|not)))
                            # hide noisy/ephemeral fields
