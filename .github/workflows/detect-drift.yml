@@ -112,7 +112,8 @@ jobs:
                      | ($ch.before // {} ) as $before
                      | ($ch.after  // {} ) as $after
                      | ($ch.after_unknown // {} ) as $unk
-                     | ( (($before|paths(scalars)) + ($after|paths(scalars))) | unique ) as $paths
+                     # paths(scalars) emits a stream; collect to arrays first, then combine
+                     | ( ( [ $before | paths(scalars) ] + [ $after | paths(scalars) ] ) | add | unique ) as $paths
                      | {
                          address: $rc.address,
                          act: action($ch.actions),
