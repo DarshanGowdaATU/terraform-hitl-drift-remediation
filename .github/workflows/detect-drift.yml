@@ -83,7 +83,7 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      # Build attribute-level diffs for Slack (before → after), trimmed for Slack limits
+      # Build attribute-level diffs for Slack (before → after), safely truncated
       - name: Summarize drift (details for Slack)
         if: env.PLAN_EXIT == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true')
         run: |
@@ -125,6 +125,7 @@ jobs:
                                u: (try $unk|getpath(.)    catch false)
                              })
                            | map(select(.b != .a and (.u|not)))
+                           # hide noisy/ephemeral fields
                            | map(select(.k|test("(^|\\.)id$|(^|\\.)arn$|(^|\\.)owner_id$|(^|\\.)tags_all(\\.|$)|(^|\\.)create_date$|(^|\\.)modification_date$"; "i")|not))
                            | .[0:12]
                          )
@@ -133,13 +134,16 @@ jobs:
                    | map(
                        if (.act=="add" or .act=="destroy") and (.diffs|length==0)
                          then "*\(.address)* — \(.act)"
-                         else (["*\(.address)* — \(.act)"] + (.diffs | map("• `\(.k)`: `\(.b)` → `\(.a)`"))) | join("\n")
+                         else (["*\(.address)* — \(.act)"] + (.diffs | map("- `\(.k)`: `\(.b)` → `\(.a)`"))) | join("\n")
                        end
                      )
                    | .[0:30]
                  end)
               | join("\n\n")
-            ' plan.json | head -c 2800
+            ' plan.json \
+            | awk 'BEGIN{max=2800;len=0}
+                   { l=length($0)+1; if (len+l>max){ print "..."; exit } print; len+=l }
+                   END{ if (NR==0) print "(no diff lines produced)" }'
             echo
             echo "EOF"
           } >> $GITHUB_ENV
