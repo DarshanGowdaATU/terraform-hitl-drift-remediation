@@ -104,7 +104,7 @@ jobs:
             ${{ env.TF_DIR }}/plan.json
           retention-days: 7
 
-            - name: Run Checkov
+      - name: Run Checkov
         id: checkov
         run: |
           checkov -d "$TF_DIR" -o json > checkov.json || true
@@ -135,13 +135,7 @@ jobs:
         with:
           name: checkov-${{ steps.plan.outputs.drift_id }}
           path: checkov.json
-          retention-days: 7
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: checkov-${{ steps.plan.outputs.drift_id }}
-          path: checkov.json
-          retention-days: 7
+          retention-days: 7   
 
       - name: Build Slack payload
         if: ${{ steps.plan.outputs.exitcode == '2' || github.event.inputs.force_slack == 'true' }}
@@ -174,10 +168,8 @@ jobs:
             "blocks": [
               { "type": "header", "text": { "type": "plain_text", "text": "Terraform Drift Detected" } },
               { "type": "section", "fields": [
-                  { "type": "mrkdwn", "text": "*Drift ID:*
-${DRIFT_ID}" },
-                  { "type": "mrkdwn", "text": "*Repo/Run:*
-<${RUN_URL}|Open run>" }
+                  { "type": "mrkdwn", "text": "*Drift ID:* ${DRIFT_ID}" },
+                  { "type": "mrkdwn", "text": "*Repo/Run:* <${RUN_URL}|Open run>" }
                 ]},
               { "type": "section", "fields": [
                   { "type": "mrkdwn", "text": "*Adds:* ${adds}" },
