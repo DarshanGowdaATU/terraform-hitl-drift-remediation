@@ -23,7 +23,7 @@ env:
   TF_INPUT: "false"
   AWS_REGION: "us-east-1"
   TF_DIR: "terraform"
-  SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL_ID }}
+  SLACK_CHANNEL: "C097WJUFJCU"
   OIDC_ROLE_ARN: "arn:aws:iam::147997134125:role/GitHubTerraformPlanRole"
 
 jobs:
@@ -149,7 +149,7 @@ jobs:
 
           cat > payload.json <<'JSON'
           {
-            "channel": ${{ secrets.SLACK_CHANNEL_ID }}",
+            "channel": "C097WJUFJCU",
             "text": "Terraform drift detected",
             "blocks": [
               { "type": "header", "text": { "type": "plain_text", "text": "Terraform Drift Detected" } },
