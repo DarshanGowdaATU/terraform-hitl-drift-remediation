@@ -149,7 +149,7 @@ jobs:
 
           cat > payload.json <<'JSON'
           {
-            "channel": "C097WJUFJCU",
+            "channel": ${{ secrets.SLACK_CHANNEL_ID }}",
             "text": "Terraform drift detected",
             "blocks": [
               { "type": "header", "text": { "type": "plain_text", "text": "Terraform Drift Detected" } },
