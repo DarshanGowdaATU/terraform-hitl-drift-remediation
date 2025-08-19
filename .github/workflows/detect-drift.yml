@@ -21,10 +21,10 @@ permissions:
 env:
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
-  AWS_REGION: "us-east-1"                  # keep in sync with your tf
+  AWS_REGION: "us-east-1"                  
   TF_DIR: "terraform"
-  SLACK_CHANNEL: "<YOUR_SLACK_CHANNEL_ID>" # e.g., C01234567
-  OIDC_ROLE_ARN: "arn:aws:iam::<ACCOUNT_ID>:role/GitHubTerraformPlanRole"
+  SLACK_CHANNEL: "C097WJUFJCU>"
+  OIDC_ROLE_ARN: "arn:aws:iam::147997134125:role/GitHubTerraformPlanRole"
 
 jobs:
   detect:
