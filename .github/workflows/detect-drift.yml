@@ -15,16 +15,14 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  id-token: write     # OIDC
-  contents: read
+  contents: read  # using static keys; no OIDC token needed
 
 env:
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
   AWS_REGION: "us-east-1"                  # keep in sync with your tf
   TF_DIR: "terraform"
-  SLACK_CHANNEL: "<YOUR_SLACK_CHANNEL_ID>" # e.g., C01234567
-  OIDC_ROLE_ARN: "arn:aws:iam::<ACCOUNT_ID>:role/GitHubTerraformPlanRole"
+  SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL_ID }}
 
 jobs:
   detect:
@@ -45,10 +43,11 @@ jobs:
       - name: Install Checkov (CIS scan)
         run: pipx install checkov
 
-      - name: Configure AWS (OIDC AssumeRole)
+      - name: Configure AWS (static keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.OIDC_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Who am I in AWS?
@@ -63,7 +62,7 @@ jobs:
         run: |
           terraform version
           jq --version
-          python3 -m pip show checkov || true
+          checkov --version || true
 
       - name: Terraform init
         working-directory: ${{ env.TF_DIR }}
@@ -152,8 +151,210 @@ jobs:
             "blocks": [
               { "type": "header", "text": { "type": "plain_text", "text": "Terraform Drift Detected" } },
               { "type": "section", "fields": [
-                  { "type": "mrkdwn", "text": "*Drift ID:*\n${DRIFT_ID}" },
-                  { "type": "mrkdwn", "text": "*Repo/Run:*\n<${RUN_URL}|Open run>" }
+                  { "type": "mrkdwn", "text": "*Drift ID:*
+${DRIFT_ID}" },
+                  { "type": "mrkdwn", "text": "*Repo/Run:*
+<${RUN_URL}|Open run>" }
+                ]},
+              { "type": "section", "fields": [
+                  { "type": "mrkdwn", "text": "*Adds:* ${adds}" },
+                  { "type": "mrkdwn", "text": "*Changes:* ${changes}" },
+                  { "type": "mrkdwn", "text": "*Destroys:* ${destroys}" }
+                ]},
+              { "type": "context", "elements": [
+                  { "type": "mrkdwn", "text": "*CIS pre-check:* ${FAILS} failing checks, ${WARNS} warnings" }
+                ]},
+              { "type": "actions", "elements": [
+                  { "type": "button", "text": { "type": "plain_text", "text": "Approve Remediation" }, "style": "primary",
+                    "action_id": "approve_remediation", "value": "{\"decision\":\"approve\",\"drift_id\":\"${DRIFT_ID}\",\"run_url\":\"${RUN_URL}\"}" },
+                  { "type": "button", "text": { "type": "plain_text", "text": "Reject" }, "style": "danger",
+                    "action_id": "reject_remediation", "value": "{\"decision\":\"reject\",\"drift_id\":\"${DRIFT_ID}\",\"run_url\":\"${RUN_URL}\"}" }
+                ]}
+            ]
+          }
+          JSON
+
+          # Replace placeholders (single-quoted heredoc prevents expansion above)
+          sed -i "s/\${SLACK_CHANNEL}/${SLACK_CHANNEL}/g" payload.json
+          sed -i "s/\${DRIFT_ID}/${DRIFT_ID}/g" payload.json
+          sed -i "s|\${RUN_URL}|${RUN_URL}|g" payload.json
+          sed -i "s/\${FAILS}/${FAILS}/g" payload.json
+          sed -i "s/\${WARNS}/${WARNS}/g" payload.json
+          sed -i "s/\${adds}/${adds}/g" payload.json
+          sed -i "s/\${changes}/${changes}/g" payload.json
+          sed -i "s/\${destroys}/${destroys}/g" payload.json
+
+      - name: Post to Slack
+        if: steps.payload.outcome == 'success'
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          curl -sS -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-type: application/json; charset=utf-8" \
+            --data @payload.json | tee /tmp/slack_response.json
+          jq -e '.ok == true' /tmp/slack_response.json > /dev/null
+
+      - name: No drift (exit=0)
+        if: ${{ steps.plan.outputs.exitcode == '0' && github.event.inputs.force_slack != 'true' }}
+        run: echo "No drift."
+name: Detect Terraform Drift
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"     # every 5 minutes (tune as needed)
+  workflow_dispatch:
+    inputs:
+      force_slack:
+        type: boolean
+        default: false
+        description: "Post to Slack even without drift"
+
+concurrency:
+  group: drift-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read  # using static keys; no OIDC token needed
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  AWS_REGION: "us-east-1"                  # keep in sync with your tf
+  TF_DIR: "terraform"
+  SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL_ID }}
+
+jobs:
+  detect:
+    name: Detect & Notify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # System deps and Checkov
+      - name: System deps for tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pipx jq
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install Checkov (CIS scan)
+        run: pipx install checkov
+
+      - name: Configure AWS (static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Who am I in AWS?
+        run: aws sts get-caller-identity
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: Versions
+        run: |
+          terraform version
+          jq --version
+          checkov --version || true
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false -no-color
+
+      - name: Plan (refresh-only, detailed exit code)
+        id: plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          set +e
+          terraform plan -refresh-only -detailed-exitcode -lock-timeout=2m -out=tfplan.out -no-color -input=false
+          code=$?
+          echo "exitcode=$code" >> $GITHUB_OUTPUT
+
+          if [ $code -eq 1 ]; then
+            # plan failed; create an empty plan.json so downstream jq doesn't explode
+            echo '{}' > plan.json
+            echo 'Plan failed; created empty plan.json for diagnostics.'
+            sha="$(sha256sum plan.json | awk '{print $1}')"
+            echo "drift_id=${sha::12}-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          terraform show -no-color tfplan.out > plan.txt
+          terraform show -json tfplan.out > plan.json
+          sha="$(sha256sum plan.json | awk '{print $1}')"
+          echo "drift_id=${sha::12}-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
+          exit 0
+
+      - name: Upload plan artifacts
+        if: ${{ always() && steps.plan.outputs.exitcode != '1' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ steps.plan.outputs.drift_id }}
+          path: |
+            ${{ env.TF_DIR }}/tfplan.out
+            ${{ env.TF_DIR }}/plan.txt
+            ${{ env.TF_DIR }}/plan.json
+          retention-days: 7
+
+      - name: Run Checkov
+        id: checkov
+        run: |
+          checkov -d $TF_DIR -o json > checkov.json || true
+          fails=$(jq '[.results.failed_checks[]?] | length' checkov.json)
+          warns=$(jq '[.results.parsing_errors[]?, .results.resource_skipped_checks[]?] | length' checkov.json)
+          echo "failed=$fails" >> $GITHUB_OUTPUT
+          echo "warned=$warns" >> $GITHUB_OUTPUT
+
+      - name: Upload Checkov report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-${{ steps.plan.outputs.drift_id }}
+          path: checkov.json
+          retention-days: 7
+
+      - name: Build Slack payload
+        if: ${{ steps.plan.outputs.exitcode == '2' || github.event.inputs.force_slack == 'true' }}
+        id: payload
+        env:
+          DRIFT_ID: ${{ steps.plan.outputs.drift_id }}
+          EXIT: ${{ steps.plan.outputs.exitcode }}
+          FAILS: ${{ steps.checkov.outputs.failed }}
+          WARNS: ${{ steps.checkov.outputs.warned }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Robust plan summary that counts replace (create+delete) correctly
+          summary="$(jq -r '
+            (.resource_changes // [])
+            | reduce .[] as $rc (
+                {adds:0, changes:0, destroys:0};
+                .adds     += (( $rc.change.actions // [] | index("create") )  | if .==null then 0 else 1 end)
+              | .changes  += (( $rc.change.actions // [] | index("update") )  | if .==null then 0 else 1 end)
+              | .destroys += (( $rc.change.actions // [] | index("delete") )  | if .==null then 0 else 1 end)
+            )' $TF_DIR/plan.json)"
+
+          adds=$(echo "$summary" | jq -r .adds)
+          changes=$(echo "$summary" | jq -r .changes)
+          destroys=$(echo "$summary" | jq -r .destroys)
+
+          cat > payload.json <<'JSON'
+          {
+            "channel": "${SLACK_CHANNEL}",
+            "text": "Terraform drift detected",
+            "blocks": [
+              { "type": "header", "text": { "type": "plain_text", "text": "Terraform Drift Detected" } },
+              { "type": "section", "fields": [
+                  { "type": "mrkdwn", "text": "*Drift ID:*
+${DRIFT_ID}" },
+                  { "type": "mrkdwn", "text": "*Repo/Run:*
+<${RUN_URL}|Open run>" }
                 ]},
               { "type": "section", "fields": [
                   { "type": "mrkdwn", "text": "*Adds:* ${adds}" },
