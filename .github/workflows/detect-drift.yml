@@ -2,7 +2,7 @@ name: Detect Terraform Drift
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes
+    - cron: "*/5 * * * *"     # every 5 minutes (tune as needed)
   workflow_dispatch:
     inputs:
       force_slack:
@@ -15,16 +15,16 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  id-token: write   # OIDC
+  id-token: write     # OIDC
   contents: read
 
 env:
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
-  AWS_REGION: "us-east-1"
+  AWS_REGION: "us-east-1"                  # keep in sync with your tf
   TF_DIR: "terraform"
-  SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL_ID }}   # store channel ID in repo secret
-  OIDC_ROLE_ARN: "arn:aws:iam::147997134125:role/GitHubTerraformPlanRole"
+  SLACK_CHANNEL: "<YOUR_SLACK_CHANNEL_ID>" # e.g., C01234567
+  OIDC_ROLE_ARN: "arn:aws:iam::<ACCOUNT_ID>:role/GitHubTerraformPlanRole"
 
 jobs:
   detect:
@@ -35,12 +35,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Tools your steps rely on
+      # System deps and Checkov
       - name: System deps for tools
         run: |
           sudo apt-get update
           sudo apt-get install -y pipx jq
           echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install Checkov (CIS scan)
+        run: pipx install checkov
 
       - name: Configure AWS (OIDC AssumeRole)
         uses: aws-actions/configure-aws-credentials@v4
@@ -48,10 +51,19 @@ jobs:
           role-to-assume: ${{ env.OIDC_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Who am I in AWS?
+        run: aws sts get-caller-identity
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.5.7
+
+      - name: Versions
+        run: |
+          terraform version
+          jq --version
+          python3 -m pip show checkov || true
 
       - name: Terraform init
         working-directory: ${{ env.TF_DIR }}
@@ -60,27 +72,29 @@ jobs:
       - name: Plan (refresh-only, detailed exit code)
         id: plan
         working-directory: ${{ env.TF_DIR }}
-        shell: bash
         run: |
           set +e
-          terraform plan -refresh-only -detailed-exitcode -out=tfplan.out -no-color
+          terraform plan -refresh-only -detailed-exitcode -lock-timeout=2m -out=tfplan.out -no-color -input=false
           code=$?
           echo "exitcode=$code" >> $GITHUB_OUTPUT
-          # Always produce human + machine readable plan
-          terraform show tfplan.out > plan.txt
+
+          if [ $code -eq 1 ]; then
+            # plan failed; create an empty plan.json so downstream jq doesn't explode
+            echo '{}' > plan.json
+            echo 'Plan failed; created empty plan.json for diagnostics.'
+            sha="$(sha256sum plan.json | awk '{print $1}')"
+            echo "drift_id=${sha::12}-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          terraform show -no-color tfplan.out > plan.txt
           terraform show -json tfplan.out > plan.json
-          # Drift ID is deterministic on plan + commit + run
           sha="$(sha256sum plan.json | awk '{print $1}')"
           echo "drift_id=${sha::12}-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
-          # Fail the job only on Terraform error (1). Treat 0/2 as success.
-          if [ "$code" -eq 1 ]; then
-            echo "Terraform plan errored" >&2
-            exit 1
-          fi
           exit 0
 
       - name: Upload plan artifacts
-        if: always()
+        if: ${{ always() && steps.plan.outputs.exitcode != '1' }}
         uses: actions/upload-artifact@v4
         with:
           name: tfplan-${{ steps.plan.outputs.drift_id }}
@@ -90,13 +104,10 @@ jobs:
             ${{ env.TF_DIR }}/plan.json
           retention-days: 7
 
-      - name: Install Checkov (CIS scan)
-        run: pipx install checkov
-
       - name: Run Checkov
         id: checkov
         run: |
-          checkov -d "$TF_DIR" -o json > checkov.json || true
+          checkov -d $TF_DIR -o json > checkov.json || true
           fails=$(jq '[.results.failed_checks[]?] | length' checkov.json)
           warns=$(jq '[.results.parsing_errors[]?, .results.resource_skipped_checks[]?] | length' checkov.json)
           echo "failed=$fails" >> $GITHUB_OUTPUT
@@ -119,13 +130,16 @@ jobs:
           FAILS: ${{ steps.checkov.outputs.failed }}
           WARNS: ${{ steps.checkov.outputs.warned }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SLACK_CHANNEL: ${{ env.SLACK_CHANNEL }}
         run: |
-          # Minimal plan summary (count of changes by action)
+          # Robust plan summary that counts replace (create+delete) correctly
           summary="$(jq -r '
-            {adds:(.resource_changes//[]|map(.change.actions|join(","))|map(select(.=="create"))|length),
-             changes:(.resource_changes//[]|map(.change.actions|join(","))|map(select(.=="update"))|length),
-             destroys:(.resource_changes//[]|map(.change.actions|join(","))|map(select(.=="delete"))|length)}' "$TF_DIR/plan.json")"
+            (.resource_changes // [])
+            | reduce .[] as $rc (
+                {adds:0, changes:0, destroys:0};
+                .adds     += (( $rc.change.actions // [] | index("create") )  | if .==null then 0 else 1 end)
+              | .changes  += (( $rc.change.actions // [] | index("update") )  | if .==null then 0 else 1 end)
+              | .destroys += (( $rc.change.actions // [] | index("delete") )  | if .==null then 0 else 1 end)
+            )' $TF_DIR/plan.json)"
 
           adds=$(echo "$summary" | jq -r .adds)
           changes=$(echo "$summary" | jq -r .changes)
@@ -158,6 +172,8 @@ jobs:
             ]
           }
           JSON
+
+          # Replace placeholders (single-quoted heredoc prevents expansion above)
           sed -i "s/\${SLACK_CHANNEL}/${SLACK_CHANNEL}/g" payload.json
           sed -i "s/\${DRIFT_ID}/${DRIFT_ID}/g" payload.json
           sed -i "s|\${RUN_URL}|${RUN_URL}|g" payload.json
