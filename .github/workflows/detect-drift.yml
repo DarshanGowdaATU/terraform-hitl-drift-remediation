@@ -2,7 +2,7 @@ name: Detect Terraform Drift
 
 on:
   schedule:
-    - cron: "*/5 * * * *"     # every 5 minutes (tune as needed)
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       force_slack:
@@ -15,13 +15,13 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  id-token: write     # OIDC
+  id-token: write
   contents: read
 
 env:
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
-  AWS_REGION: "us-east-1"                  # keep in sync with your tf
+  AWS_REGION: "us-east-1"
   TF_DIR: "terraform"
   SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL_ID }}
   OIDC_ROLE_ARN: "arn:aws:iam::147997134125:role/GitHubTerraformPlanRole"
@@ -35,35 +35,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # System deps and Checkov
-      - name: System deps for tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pipx jq
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Install Checkov (CIS scan)
-        run: pipx install checkov
-
       - name: Configure AWS (OIDC AssumeRole)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.OIDC_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Who am I in AWS?
+      - name: Setup tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pipx jq
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Who am I (sanity)
         run: aws sts get-caller-identity
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.5.7
-
-      - name: Versions
-        run: |
-          terraform version
-          jq --version
-          checkov --version || true
+          terraform_wrapper: false  # IMPORTANT: preserve detailed exit codes
 
       - name: Terraform init
         working-directory: ${{ env.TF_DIR }}
@@ -77,7 +68,6 @@ jobs:
           terraform plan -refresh-only -detailed-exitcode -lock-timeout=2m -out=tfplan.out -no-color -input=false
           code=$?
           echo "exitcode=$code" >> $GITHUB_OUTPUT
-
           if [ $code -eq 1 ]; then
             # plan failed; create an empty plan.json so downstream jq doesn't explode
             echo '{}' > plan.json
@@ -86,15 +76,17 @@ jobs:
             echo "drift_id=${sha::12}-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
             exit 0
           fi
-
           terraform show -no-color tfplan.out > plan.txt
           terraform show -json tfplan.out > plan.json
           sha="$(sha256sum plan.json | awk '{print $1}')"
           echo "drift_id=${sha::12}-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
           exit 0
 
+      - name: Debug plan exit code
+        run: echo "Plan exit code was: ${{ steps.plan.outputs.exitcode }}"
+
       - name: Upload plan artifacts
-        if: ${{ always() && steps.plan.outputs.exitcode != '1' }}
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tfplan-${{ steps.plan.outputs.drift_id }}
@@ -104,19 +96,20 @@ jobs:
             ${{ env.TF_DIR }}/plan.json
           retention-days: 7
 
+      - name: Install Checkov (CIS scan)
+        run: pipx install checkov
+
       - name: Run Checkov
         id: checkov
         run: |
           checkov -d "$TF_DIR" -o json > checkov.json || true
-
-          # Handle both Checkov 2.x (object) and 3.x (array) JSON schemas
+          # Handle both Checkov 2.x (object) and 3.x (array) JSON
           fails=$(jq -r '
             if type=="array" then
               map((.results.failed_checks // []) | length) | add
             else
               (.results.failed_checks // []) | length
             end' checkov.json 2>/dev/null || echo 0)
-
           warns=$(jq -r '
             if type=="array" then
               ( (map((.results.parsing_errors // []) | length) | add)
@@ -125,7 +118,6 @@ jobs:
               (((.results.parsing_errors // []) | length)
                 + ((.results.resource_skipped_checks // []) | length))
             end' checkov.json 2>/dev/null || echo 0)
-
           echo "failed=${fails}" >> $GITHUB_OUTPUT
           echo "warned=${warns}" >> $GITHUB_OUTPUT
 
@@ -135,10 +127,10 @@ jobs:
         with:
           name: checkov-${{ steps.plan.outputs.drift_id }}
           path: checkov.json
-          retention-days: 7   
+          retention-days: 7
 
       - name: Build Slack payload
-        if: ${{ steps.plan.outputs.exitcode == '2' || github.event.inputs.force_slack == 'true' }}
+        if: ${{ steps.plan.outputs.exitcode == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true') }}
         id: payload
         env:
           DRIFT_ID: ${{ steps.plan.outputs.drift_id }}
@@ -147,16 +139,10 @@ jobs:
           WARNS: ${{ steps.checkov.outputs.warned }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # Robust plan summary that counts replace (create+delete) correctly
           summary="$(jq -r '
-            (.resource_changes // [])
-            | reduce .[] as $rc (
-                {adds:0, changes:0, destroys:0};
-                .adds     += (( $rc.change.actions // [] | index("create") )  | if .==null then 0 else 1 end)
-              | .changes  += (( $rc.change.actions // [] | index("update") )  | if .==null then 0 else 1 end)
-              | .destroys += (( $rc.change.actions // [] | index("delete") )  | if .==null then 0 else 1 end)
-            )' $TF_DIR/plan.json)"
-
+            {adds:(.resource_changes//[]|map(.change.actions|join(","))|map(select(.=="create"))|length),
+             changes:(.resource_changes//[]|map(.change.actions|join(","))|map(select(.=="update"))|length),
+             destroys:(.resource_changes//[]|map(.change.actions|join(","))|map(select(.=="delete"))|length)}' $TF_DIR/plan.json)"
           adds=$(echo "$summary" | jq -r .adds)
           changes=$(echo "$summary" | jq -r .changes)
           destroys=$(echo "$summary" | jq -r .destroys)
@@ -168,8 +154,8 @@ jobs:
             "blocks": [
               { "type": "header", "text": { "type": "plain_text", "text": "Terraform Drift Detected" } },
               { "type": "section", "fields": [
-                  { "type": "mrkdwn", "text": "*Drift ID:* ${DRIFT_ID}" },
-                  { "type": "mrkdwn", "text": "*Repo/Run:* <${RUN_URL}|Open run>" }
+                  { "type": "mrkdwn", "text": "*Drift ID:*\n${DRIFT_ID}" },
+                  { "type": "mrkdwn", "text": "*Repo/Run:*\n<${RUN_URL}|Open run>" }
                 ]},
               { "type": "section", "fields": [
                   { "type": "mrkdwn", "text": "*Adds:* ${adds}" },
@@ -188,9 +174,6 @@ jobs:
             ]
           }
           JSON
-
-          # Replace placeholders (single-quoted heredoc prevents expansion above)
-          sed -i "s/\${SLACK_CHANNEL}/${SLACK_CHANNEL}/g" payload.json
           sed -i "s/\${DRIFT_ID}/${DRIFT_ID}/g" payload.json
           sed -i "s|\${RUN_URL}|${RUN_URL}|g" payload.json
           sed -i "s/\${FAILS}/${FAILS}/g" payload.json
@@ -211,5 +194,5 @@ jobs:
           jq -e '.ok == true' /tmp/slack_response.json > /dev/null
 
       - name: No drift (exit=0)
-        if: ${{ steps.plan.outputs.exitcode == '0' && github.event.inputs.force_slack != 'true' }}
+        if: ${{ steps.plan.outputs.exitcode == '0' && !(github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true') }}
         run: echo "No drift."
