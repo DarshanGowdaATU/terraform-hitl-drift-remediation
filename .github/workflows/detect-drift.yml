@@ -24,7 +24,7 @@ env:
   AWS_REGION: "us-east-1"                  # keep in sync with your tf
   TF_DIR: "terraform"
   SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL_ID }}
-  OIDC_ROLE_ARN: "arn:aws:iam::147997134125:role/GitHubTerraformPlanRole"
+  OIDC_ROLE_ARN: "arn:aws:iam::<ACCOUNT_ID>:role/GitHubTerraformPlanRole"
 
 jobs:
   detect:
@@ -104,16 +104,38 @@ jobs:
             ${{ env.TF_DIR }}/plan.json
           retention-days: 7
 
-      - name: Run Checkov
+            - name: Run Checkov
         id: checkov
         run: |
-          checkov -d $TF_DIR -o json > checkov.json || true
-          fails=$(jq '[.results.failed_checks[]?] | length' checkov.json)
-          warns=$(jq '[.results.parsing_errors[]?, .results.resource_skipped_checks[]?] | length' checkov.json)
-          echo "failed=$fails" >> $GITHUB_OUTPUT
-          echo "warned=$warns" >> $GITHUB_OUTPUT
+          checkov -d "$TF_DIR" -o json > checkov.json || true
+
+          # Handle both Checkov 2.x (object) and 3.x (array) JSON schemas
+          fails=$(jq -r '
+            if type=="array" then
+              map((.results.failed_checks // []) | length) | add
+            else
+              (.results.failed_checks // []) | length
+            end' checkov.json 2>/dev/null || echo 0)
+
+          warns=$(jq -r '
+            if type=="array" then
+              ( (map((.results.parsing_errors // []) | length) | add)
+                + (map((.results.resource_skipped_checks // []) | length) | add) )
+            else
+              (((.results.parsing_errors // []) | length)
+                + ((.results.resource_skipped_checks // []) | length))
+            end' checkov.json 2>/dev/null || echo 0)
+
+          echo "failed=${fails}" >> $GITHUB_OUTPUT
+          echo "warned=${warns}" >> $GITHUB_OUTPUT
 
       - name: Upload Checkov report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-${{ steps.plan.outputs.drift_id }}
+          path: checkov.json
+          retention-days: 7
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -152,8 +174,10 @@ jobs:
             "blocks": [
               { "type": "header", "text": { "type": "plain_text", "text": "Terraform Drift Detected" } },
               { "type": "section", "fields": [
-                  { "type": "mrkdwn", "text": "*Drift ID:* ${DRIFT_ID}" },
-                  { "type": "mrkdwn", "text": "*Repo/Run:* <${RUN_URL}|Open run>" }
+                  { "type": "mrkdwn", "text": "*Drift ID:*
+${DRIFT_ID}" },
+                  { "type": "mrkdwn", "text": "*Repo/Run:*
+<${RUN_URL}|Open run>" }
                 ]},
               { "type": "section", "fields": [
                   { "type": "mrkdwn", "text": "*Adds:* ${adds}" },
