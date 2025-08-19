@@ -24,7 +24,7 @@ env:
   AWS_REGION: "us-east-1"                  # keep in sync with your tf
   TF_DIR: "terraform"
   SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL_ID }}
-  OIDC_ROLE_ARN: "arn:aws:iam::147997134125:role/GitHubTerraformPlanRolee"
+  OIDC_ROLE_ARN: "arn:aws:iam::147997134125:role/GitHubTerraformPlanRole"
 
 jobs:
   detect:
