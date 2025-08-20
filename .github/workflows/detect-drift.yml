@@ -2,7 +2,7 @@ name: Detect Terraform Drift
 
 on:
   schedule:
-    - cron: "* 5 * * *"
+    - cron: "*/5 * * * *" # every 5 minutes
   workflow_dispatch:
     inputs:
       force_slack:
@@ -25,6 +25,7 @@ env:
   TF_DIR: "terraform"
   SLACK_CHANNEL: "C097WJUFJCU"
   OIDC_ROLE_ARN: "arn:aws:iam::147997134125:role/GitHubTerraformPlanRole"
+  TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
 
 jobs:
   detect:
@@ -46,6 +47,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pipx jq
           echo "$HOME/.local/bin" >> $GITHUB_PATH
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
 
       - name: Who am I (sanity)
         run: aws sts get-caller-identity
@@ -56,33 +58,56 @@ jobs:
           terraform_version: 1.5.7
           terraform_wrapper: false  # preserve detailed exit codes
 
+      # Cache Terraform providers (speed up init/plan)
+      - name: Cache .terraform providers
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.TF_DIR }}/.terraform
+            ~/.terraform.d/plugin-cache
+          key: tf-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+
       - name: Terraform init
         working-directory: ${{ env.TF_DIR }}
         run: terraform init -input=false -no-color
+
+      # Get current Terraform workspace (sanitized)
+      - name: Get Terraform workspace
+        id: ws
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          ws="$(terraform workspace show 2>/dev/null || echo default)"
+          safe_ws="$(echo "$ws" | tr -cd '[:alnum:]._-' )"
+          echo "name=$safe_ws" >> $GITHUB_OUTPUT
 
       - name: Plan (refresh-only, detailed exit code)
         id: plan
         working-directory: ${{ env.TF_DIR }}
         run: |
           set +e
-          terraform plan -refresh-only -detailed-exitcode -lock-timeout=2m -out=tfplan.out -no-color -input=false
+          # Capture stdout/stderr separately for better failure UX
+          terraform plan -refresh-only -detailed-exitcode -lock-timeout=2m -out=tfplan.out -no-color -input=false \
+            1>plan_stdout.txt 2>plan_error.txt
           code=$?
           echo "exitcode=$code" >> $GITHUB_OUTPUT
+
           if [ $code -eq 1 ]; then
+            # Failure: keep a stub JSON for downstream steps; drift_id derived from error content
             echo '{}' > plan.json
-            echo 'Plan failed; created empty plan.json for diagnostics.'
-            sha="$(sha256sum plan.json | awk '{print $1}')"
+            sha="$(sha256sum plan_error.txt | awk '{print $1}')"
             echo "drift_id=${sha::12}-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
             exit 0
           fi
-          terraform show -no-color tfplan.out > plan.txt
+
+          # Success (0) or Drift (2): render artifacts and drift_id from plan.json
+          cp plan_stdout.txt plan.txt
           terraform show -json tfplan.out > plan.json
           sha="$(sha256sum plan.json | awk '{print $1}')"
           echo "drift_id=${sha::12}-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
           exit 0
 
       - name: Debug plan exit code
-        run: echo "Plan exit code was:${{ steps.plan.outputs.exitcode }}"
+        run: echo "Plan exit code was: ${{ steps.plan.outputs.exitcode }}"
 
       - name: Upload plan artifacts
         if: always()
@@ -93,6 +118,8 @@ jobs:
             ${{ env.TF_DIR }}/tfplan.out
             ${{ env.TF_DIR }}/plan.txt
             ${{ env.TF_DIR }}/plan.json
+            ${{ env.TF_DIR }}/plan_error.txt
+            ${{ env.TF_DIR }}/plan_stdout.txt
           retention-days: 7
 
       - name: Install Checkov (CIS scan)
@@ -128,9 +155,9 @@ jobs:
           path: checkov.json
           retention-days: 7
 
-      # === UPDATED: robust counts + fallback to plan.txt; drift_id carried in action_id ===
-      - name: Build Slack payload
-        if: ${{ steps.plan.outputs.exitcode == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true') }}
+      # === Slack payload for DRIFT or forced manual post ===
+      - name: Build Slack payload (drift or forced)
+        if: ${{ steps.plan.outputs.exitcode == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true' && steps.plan.outputs.exitcode != '1') }}
         id: payload
         env:
           DRIFT_ID: ${{ steps.plan.outputs.drift_id }}
@@ -138,8 +165,14 @@ jobs:
           FAILS: ${{ steps.checkov.outputs.failed }}
           WARNS: ${{ steps.checkov.outputs.warned }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WS: ${{ steps.ws.outputs.name }}
+          REGION: ${{ env.AWS_REGION }}
         run: |
-          # 1) Try JSON-based counts (handles replace actions too)
+          # Sanitize env tag for action_id
+          env_tag="${WS}/${REGION}"
+          safe_env_tag="$(echo "$env_tag" | tr -cd '[:alnum:]._-/ ' | tr ' /' '--')"
+
+          # 1) JSON-based counts
           summary="$(jq -r '
             (.resource_changes // [])
             | reduce .[] as $rc (
@@ -154,27 +187,20 @@ jobs:
 
           # JSON-derived lists (top 10)
           creates_list_json=$(jq -r '
-            [(.resource_changes // [])[]
-             | select((.change.actions // []) | index("create"))
-             | .address] | .[0:10]
+            [(.resource_changes // [])[] | select((.change.actions // []) | index("create")) | .address] | .[0:10]
             | if length==0 then "" else map("• `" + . + "`") | join("\n") end
           ' "$TF_DIR/plan.json")
 
           updates_list_json=$(jq -r '
-            [(.resource_changes // [])[]
-             | select((.change.actions // []) | index("update"))
-             | .address] | .[0:10]
+            [(.resource_changes // [])[] | select((.change.actions // []) | index("update")) | .address] | .[0:10]
             | if length==0 then "" else map("• `" + . + "`") | join("\n") end
           ' "$TF_DIR/plan.json")
 
           deletes_list_json=$(jq -r '
-            [(.resource_changes // [])[]
-             | select((.change.actions // []) | index("delete"))
-             | .address] | .[0:10]
+            [(.resource_changes // [])[] | select((.change.actions // []) | index("delete")) | .address] | .[0:10]
             | if length==0 then "" else map("• `" + . + "`") | join("\n") end
           ' "$TF_DIR/plan.json")
 
-          # 2) If JSON shows all zeros, fall back to parsing plan.txt for resource-level +/-/~
           total=$((adds + changes + destroys))
           if [ "$total" -eq 0 ]; then
             creates_txt=$(grep -E '^[[:space:]]*\+ resource "' "$TF_DIR/plan.txt" | sed -E 's/^ *\+ resource "([^"]+)" "([^"]+)".*$/\1.\2/' | head -n 10 || true)
@@ -185,21 +211,17 @@ jobs:
             changes=$(printf "%s\n" "$updates_txt" | grep -c . || echo 0)
             destroys=$(printf "%s\n" "$deletes_txt" | grep -c . || echo 0)
 
-            # Bullet formatting (or 'none')
             if [ -n "$creates_txt" ]; then creates_list=$(printf "%s\n" "$creates_txt" | sed 's/^/• `/' | sed 's/$/`/'); else creates_list="none"; fi
             if [ -n "$updates_txt" ]; then updates_list=$(printf "%s\n" "$updates_txt" | sed 's/^/• `/' | sed 's/$/`/'); else updates_list="none"; fi
             if [ -n "$deletes_txt" ]; then deletes_list=$(printf "%s\n" "$deletes_txt" | sed 's/^/• `/' | sed 's/$/`/'); else deletes_list="none"; fi
           else
-            # Use JSON lists if JSON counts found anything
             creates_list="${creates_list_json:-none}"
             updates_list="${updates_list_json:-none}"
             deletes_list="${deletes_list_json:-none}"
           fi
 
-          # Short diff excerpt (first ~30 change lines)
           diff_snippet="$(grep -E '^[[:space:]]*[~+-]' "$TF_DIR/plan.txt" | head -n 30)"
 
-          # Build payload with jq (interpolation only)
           jq -n \
             --arg channel "$SLACK_CHANNEL" \
             --arg drift "$DRIFT_ID" \
@@ -213,13 +235,18 @@ jobs:
             --arg updates "$updates_list" \
             --arg deletes "$deletes_list" \
             --arg diff "$diff_snippet" \
+            --arg envtag "$env_tag" \
+            --arg safeenv "$safe_env_tag" \
             '
             {
               channel: $channel,
               text: "Terraform drift detected",
               blocks: [
-                { "type": "header", "block_id": ("drift::" + $drift), "text": { "type": "plain_text", "text": "Terraform Drift Detected" } },
+                { "type": "header",
+                  "block_id": ("drift::" + $drift),
+                  "text": { "type": "plain_text", "text": ("Terraform Drift Detected — " + $envtag) } },
                 { "type": "section", "fields": [
+                    { "type": "mrkdwn", "text": "*Env:*\n\($envtag)" },
                     { "type": "mrkdwn", "text": "*Drift ID:*\n\($drift)" },
                     { "type": "mrkdwn", "text": "*Repo/Run:*\n<\($runurl)|Open run>" }
                   ]},
@@ -238,24 +265,86 @@ jobs:
                 { "type": "actions", "elements": [
                     { "type": "button",
                       "text": { "type": "plain_text", "text": "Approve Remediation" }, "style": "primary",
-                      "action_id": ("approve_remediation::" + $drift), "value": "approve" },
+                      "action_id": ("approve_remediation::" + $safeenv + "::" + $drift), "value": "approve" },
                     { "type": "button",
                       "text": { "type": "plain_text", "text": "Reject" }, "style": "danger",
-                      "action_id": ("reject_remediation::" + $drift), "value": "reject" }
+                      "action_id": ("reject_remediation::" + $safeenv + "::" + $drift), "value": "reject" }
                   ]}
               ]
             }' > payload.json
 
-      - name: Post to Slack
+      - name: Post to Slack (drift or forced)
         if: steps.payload.outcome == 'success'
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          DRIFT_ID: ${{ steps.plan.outputs.drift_id }}
         run: |
-          curl -sS -X POST https://slack.com/api/chat.postMessage \
+          resp="$(curl -sS -X POST https://slack.com/api/chat.postMessage \
             -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
             -H "Content-type: application/json; charset=utf-8" \
-            --data @payload.json | tee /tmp/slack_response.json
+            --data @payload.json)"
+          echo "$resp" | tee /tmp/slack_response.json
           jq -e '.ok == true' /tmp/slack_response.json > /dev/null
+          # Persist channel + ts so Flask can thread remediation result
+          jq -r --arg drift "$DRIFT_ID" '{channel:.channel, ts:.ts, drift_id:$drift}' /tmp/slack_response.json \
+            > "slack-${DRIFT_ID}.json"
+
+      - name: Build Slack payload (plan failed — manual runs only)
+        if: ${{ steps.plan.outputs.exitcode == '1' && github.event_name == 'workflow_dispatch' }}
+        id: payload_failed
+        env:
+          DRIFT_ID: ${{ steps.plan.outputs.drift_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WS: ${{ steps.ws.outputs.name }}
+          REGION: ${{ env.AWS_REGION }}
+        run: |
+          env_tag="${WS}/${REGION}"
+          err_tail="$(tail -n 40 "$TF_DIR/plan_error.txt" 2>/dev/null || echo "No error output available.")"
+          jq -n \
+            --arg channel "$SLACK_CHANNEL" \
+            --arg drift "$DRIFT_ID" \
+            --arg runurl "$RUN_URL" \
+            --arg envtag "$env_tag" \
+            --arg err "$err_tail" \
+            '
+            {
+              channel: $channel,
+              text: "Terraform plan failed",
+              blocks: [
+                { "type": "header",
+                  "block_id": ("plan_failed::" + $drift),
+                  "text": { "type": "plain_text", "text": ("Terraform Plan Failed — " + $envtag) } },
+                { "type": "section", "fields": [
+                    { "type": "mrkdwn", "text": "*Env:*\n\($envtag)" },
+                    { "type": "mrkdwn", "text": "*Drift/Run ID:*\n\($drift)" },
+                    { "type": "mrkdwn", "text": "*Repo/Run:*\n<\($runurl)|Open run>" }
+                  ]},
+                { "type": "section", "text": { "type": "mrkdwn", "text": ("*Error (last 40 lines):*\n```\($err)```") } }
+              ]
+            }' > payload_failed.json
+
+      - name: Post to Slack (plan failed)
+        if: steps.payload_failed.outcome == 'success'
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          DRIFT_ID: ${{ steps.plan.outputs.drift_id }}
+        run: |
+          resp="$(curl -sS -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-type: application/json; charset=utf-8" \
+            --data @payload_failed.json)"
+          echo "$resp" | tee /tmp/slack_response_failed.json
+          jq -e '.ok == true' /tmp/slack_response_failed.json > /dev/null
+          jq -r --arg drift "$DRIFT_ID" '{channel:.channel, ts:.ts, drift_id:$drift}' /tmp/slack_response_failed.json \
+            > "slack-${DRIFT_ID}.json"
+
+      - name: Upload Slack metadata (for threaded remediation reply)
+        if: ${{ (steps.payload.outcome == 'success') || (steps.payload_failed.outcome == 'success') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: slack-${{ steps.plan.outputs.drift_id }}
+          path: slack-${{ steps.plan.outputs.drift_id }}.json
+          retention-days: 7
 
       - name: No drift (exit=0)
         if: ${{ steps.plan.outputs.exitcode == '0' && !(github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true') }}
