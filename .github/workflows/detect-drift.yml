@@ -127,7 +127,8 @@ jobs:
           name: checkov-${{ steps.plan.outputs.drift_id }}
           path: checkov.json
           retention-days: 7
-          
+
+      # === UPDATED: robust counts + detailed lists/snippet; buttons stay approve/reject ===
       - name: Build Slack payload
         if: ${{ steps.plan.outputs.exitcode == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true') }}
         id: payload
@@ -138,28 +139,34 @@ jobs:
           WARNS: ${{ steps.checkov.outputs.warned }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # Counts
+          # Robust counts: count a resource if an action is PRESENT (covers replace: ["delete","create"])
           summary="$(jq -r '
-            {adds:(.resource_changes//[]|map(.change.actions|join(","))|map(select(.=="create"))|length),
-             changes:(.resource_changes//[]|map(.change.actions|join(","))|map(select(.=="update"))|length),
-             destroys:(.resource_changes//[]|map(.change.actions|join(","))|map(select(.=="delete"))|length)}' $TF_DIR/plan.json)"
+            (.resource_changes // [])
+            | reduce .[] as $rc (
+                {adds:0, changes:0, destroys:0};
+                .adds     += (( $rc.change.actions // [] | index("create") )  | if .==null then 0 else 1 end)
+              | .changes  += (( $rc.change.actions // [] | index("update") )  | if .==null then 0 else 1 end)
+              | .destroys += (( $rc.change.actions // [] | index("delete") )  | if .==null then 0 else 1 end)
+            )' $TF_DIR/plan.json)"
           adds=$(echo "$summary" | jq -r .adds)
           changes=$(echo "$summary" | jq -r .changes)
           destroys=$(echo "$summary" | jq -r .destroys)
 
-          # Top 10 per action
+          # Top 10 resource addresses per action
           creates_list=$(jq -r '
             [(.resource_changes // [])[]
              | select((.change.actions // []) | index("create"))
              | .address] | .[0:10]
             | if length==0 then "none" else map("• `" + . + "`") | join("\n") end
           ' $TF_DIR/plan.json)
+
           updates_list=$(jq -r '
             [(.resource_changes // [])[]
              | select((.change.actions // []) | index("update"))
              | .address] | .[0:10]
             | if length==0 then "none" else map("• `" + . + "`") | join("\n") end
           ' $TF_DIR/plan.json)
+
           deletes_list=$(jq -r '
             [(.resource_changes // [])[]
              | select((.change.actions // []) | index("delete"))
@@ -167,10 +174,10 @@ jobs:
             | if length==0 then "none" else map("• `" + . + "`") | join("\n") end
           ' $TF_DIR/plan.json)
 
-          # Diff excerpt
+          # Short diff excerpt (first ~30 change lines from plan.txt)
           diff_snippet="$(grep -E '^[[:space:]]*[~+-]' "$TF_DIR/plan.txt" | head -n 30)"
 
-          # Build payload with jq (use interpolation, not +)
+          # Build payload with jq (use interpolation)
           jq -n \
             --arg channel "$SLACK_CHANNEL" \
             --arg drift "$DRIFT_ID" \
@@ -214,7 +221,6 @@ jobs:
                   ]}
               ]
             }' > payload.json
-
 
       - name: Post to Slack
         if: steps.payload.outcome == 'success'
