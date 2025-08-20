@@ -2,13 +2,30 @@ name: Detect Terraform Drift
 
 on:
   schedule:
-    - cron: "* 5 * * *" # every 5 minutes
+    - cron: "*/5 * * * *" # every 5 minutes
   workflow_dispatch:
     inputs:
       force_slack:
         type: boolean
         default: false
         description: "Post to Slack even without drift"
+      # --- Post-remediation mode (same workflow file) ---
+      post_remediation:
+        type: boolean
+        default: false
+        description: "Run post-remediation CIS check and reply in Slack thread"
+      drift_id:
+        type: string
+        required: false
+        description: "Drift ID (for traceability)"
+      slack_channel:
+        type: string
+        required: false
+        description: "Slack channel ID to reply into"
+      slack_thread_ts:
+        type: string
+        required: false
+        description: "Slack thread_ts to reply into"
 
 concurrency:
   group: drift-${{ github.ref }}
@@ -30,6 +47,8 @@ env:
 jobs:
   detect:
     name: Detect & Notify
+    # Only run detect on schedule or manual runs that are NOT post-remediation
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.post_remediation != 'true' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -349,3 +368,134 @@ jobs:
       - name: No drift (exit=0)
         if: ${{ steps.plan.outputs.exitcode == '0' && !(github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true') }}
         run: echo "No drift."
+
+  # ----------------------------
+  # Post-remediation mode (same file)
+  # Triggered by your Flask callback via workflow_dispatch with post_remediation=true
+  # ----------------------------
+  post_cis:
+    name: Post-remediation CIS check
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.post_remediation == 'true' }}
+
+    env:
+      TF_DIR: "terraform"
+      AWS_REGION: "us-east-1"
+      OIDC_ROLE_ARN: "arn:aws:iam::147997134125:role/GitHubTerraformPlanRole"
+
+    steps:
+      - name: Validate inputs
+        run: |
+          : "${{ github.event.inputs.slack_channel?Need slack_channel input }}"
+          : "${{ github.event.inputs.slack_thread_ts?Need slack_thread_ts input }}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC AssumeRole)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pipx jq
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install Checkov
+        run: pipx install checkov
+
+      - name: Run Checkov (post-remediation)
+        id: checkov
+        run: |
+          checkov -d "$TF_DIR" -o json > checkov.json || true
+
+          # Prefer CIS-tagged checks; fall back to summary if not present
+          FAILED_CIS=$(jq -r '
+            def norm: if type=="array" then . else [.] end;
+            try (
+              norm | (map(.results.failed_checks // []) | add)
+                  | map(select(([.benchmarks[]?.name // ""] | any(. | test("CIS"; "i")))))
+                  | length
+            ) // 0
+          ' checkov.json)
+
+          PASSED_CIS=$(jq -r '
+            def norm: if type=="array" then . else [.] end;
+            try (
+              norm | (map(.results.passed_checks // []) | add)
+                  | map(select(([.benchmarks[]?.name // ""] | any(. | test("CIS"; "i")))))
+                  | length
+            ) // 0
+          ' checkov.json)
+
+          if [ "${FAILED_CIS}" -eq 0 ] && [ "${PASSED_CIS}" -eq 0 ]; then
+            PASSED_CIS=$(jq '.summary.passed // 0' checkov.json)
+            FAILED_CIS=$(jq '.summary.failed // 0' checkov.json)
+          fi
+
+          SKIPPED=$(jq '.summary.skipped // 0' checkov.json 2>/dev/null || echo 0)
+          PARSING=$(jq '.summary.parsing_errors // 0' checkov.json 2>/dev/null || echo 0)
+
+          STATUS="PASS"; if [ "${FAILED_CIS}" -gt 0 ] || [ "${PARSING}" -gt 0 ]; then STATUS="FAIL"; fi
+
+          echo "failed=${FAILED_CIS}" >> $GITHUB_OUTPUT
+          echo "passed=${PASSED_CIS}" >> $GITHUB_OUTPUT
+          echo "skipped=${SKIPPED}" >> $GITHUB_OUTPUT
+          echo "parsing=${PARSING}" >> $GITHUB_OUTPUT
+          echo "status=${STATUS}" >> $GITHUB_OUTPUT
+
+      - name: Upload post-remediation Checkov report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-post-${{ github.event.inputs.drift_id || github.run_id }}
+          path: checkov.json
+          retention-days: 7
+
+      - name: Post summary to Slack thread
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          CHANNEL: ${{ github.event.inputs.slack_channel }}
+          THREAD_TS: ${{ github.event.inputs.slack_thread_ts }}
+          STATUS: ${{ steps.checkov.outputs.status }}
+          PASSED: ${{ steps.checkov.outputs.passed }}
+          FAILED: ${{ steps.checkov.outputs.failed }}
+          SKIPPED: ${{ steps.checkov.outputs.skipped }}
+          PARSING: ${{ steps.checkov.outputs.parsing }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cat > payload.json <<'JSON'
+          {
+            "channel": "__CHANNEL__",
+            "thread_ts": "__THREAD__",
+            "text": "Post-remediation CIS check: __STATUS__",
+            "blocks": [
+              { "type": "header", "text": { "type": "plain_text", "text": "Post-remediation CIS check: __STATUS__" } },
+              { "type": "section", "fields": [
+                { "type": "mrkdwn", "text": "*Passed:* __PASSED__" },
+                { "type": "mrkdwn", "text": "*Failed:* __FAILED__" },
+                { "type": "mrkdwn", "text": "*Skipped:* __SKIPPED__" },
+                { "type": "mrkdwn", "text": "*Parsing errors:* __PARSING__" }
+              ]},
+              { "type": "context", "elements": [
+                { "type": "mrkdwn", "text": "<__RUN_URL__|View workflow run>" }
+              ]}
+            ]
+          }
+          JSON
+          sed -i "s/__CHANNEL__/${CHANNEL}/" payload.json
+          sed -i "s/__THREAD__/${THREAD_TS}/" payload.json
+          sed -i "s/__STATUS__/${STATUS}/" payload.json
+          sed -i "s/__PASSED__/${PASSED}/" payload.json
+          sed -i "s/__FAILED__/${FAILED}/" payload.json
+          sed -i "s/__SKIPPED__/${SKIPPED}/" payload.json
+          sed -i "s/__PARSING__/${PARSING}/" payload.json
+          sed -i "s|__RUN_URL__|${RUN_URL}|" payload.json
+
+          curl -s https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-type: application/json; charset=utf-8" \
+            --data-binary @payload.json | jq -r '.ok'
