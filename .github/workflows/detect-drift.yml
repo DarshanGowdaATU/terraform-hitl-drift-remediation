@@ -107,7 +107,7 @@ jobs:
           exit 0
 
       - name: Debug plan exit code
-        run: echo "Plan exit code was: ${{ steps.plan.outputs.exitcode }}"
+        run: echo "Plan exit code was:${{ steps.plan.outputs.exitcode }}"
 
       - name: Upload plan artifacts
         if: always()
