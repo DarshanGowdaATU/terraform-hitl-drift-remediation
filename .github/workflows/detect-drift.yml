@@ -54,7 +54,7 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.5.7
-          terraform_wrapper: false  # IMPORTANT: preserve detailed exit codes
+          terraform_wrapper: false  # preserve detailed exit codes
 
       - name: Terraform init
         working-directory: ${{ env.TF_DIR }}
@@ -69,7 +69,6 @@ jobs:
           code=$?
           echo "exitcode=$code" >> $GITHUB_OUTPUT
           if [ $code -eq 1 ]; then
-            # plan failed; create an empty plan.json so downstream jq doesn't explode
             echo '{}' > plan.json
             echo 'Plan failed; created empty plan.json for diagnostics.'
             sha="$(sha256sum plan.json | awk '{print $1}')"
@@ -129,6 +128,7 @@ jobs:
           path: checkov.json
           retention-days: 7
 
+      # Detailed Slack payload + buttons with plain values for your Flask app
       - name: Build Slack payload
         if: ${{ steps.plan.outputs.exitcode == '2' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true') }}
         id: payload
@@ -139,6 +139,7 @@ jobs:
           WARNS: ${{ steps.checkov.outputs.warned }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          # Count changes
           summary="$(jq -r '
             {adds:(.resource_changes//[]|map(.change.actions|join(","))|map(select(.=="create"))|length),
              changes:(.resource_changes//[]|map(.change.actions|join(","))|map(select(.=="update"))|length),
@@ -147,40 +148,75 @@ jobs:
           changes=$(echo "$summary" | jq -r .changes)
           destroys=$(echo "$summary" | jq -r .destroys)
 
-          cat > payload.json <<'JSON'
-          {
-            "channel": "C097WJUFJCU",
-            "text": "Terraform drift detected",
-            "blocks": [
-              { "type": "header", "text": { "type": "plain_text", "text": "Terraform Drift Detected" } },
-              { "type": "section", "fields": [
-                  { "type": "mrkdwn", "text": "*Drift ID:*\n${DRIFT_ID}" },
-                  { "type": "mrkdwn", "text": "*Repo/Run:*\n<${RUN_URL}|Open run>" }
-                ]},
-              { "type": "section", "fields": [
-                  { "type": "mrkdwn", "text": "*Adds:* ${adds}" },
-                  { "type": "mrkdwn", "text": "*Changes:* ${changes}" },
-                  { "type": "mrkdwn", "text": "*Destroys:* ${destroys}" }
-                ]},
-              { "type": "context", "elements": [
-                  { "type": "mrkdwn", "text": "*CIS pre-check:* ${FAILS} failing checks, ${WARNS} warnings" }
-                ]},
-              { "type": "actions", "elements": [
-                  { "type": "button", "text": { "type": "plain_text", "text": "Approve Remediation" }, "style": "primary",
-                    "action_id": "approve_remediation", "value": "{\"decision\":\"approve\",\"drift_id\":\"${DRIFT_ID}\",\"run_url\":\"${RUN_URL}\"}" },
-                  { "type": "button", "text": { "type": "plain_text", "text": "Reject" }, "style": "danger",
-                    "action_id": "reject_remediation", "value": "{\"decision\":\"reject\",\"drift_id\":\"${DRIFT_ID}\",\"run_url\":\"${RUN_URL}\"}" }
-                ]}
-            ]
-          }
-          JSON
-          sed -i "s/\${DRIFT_ID}/${DRIFT_ID}/g" payload.json
-          sed -i "s|\${RUN_URL}|${RUN_URL}|g" payload.json
-          sed -i "s/\${FAILS}/${FAILS}/g" payload.json
-          sed -i "s/\${WARNS}/${WARNS}/g" payload.json
-          sed -i "s/\${adds}/${adds}/g" payload.json
-          sed -i "s/\${changes}/${changes}/g" payload.json
-          sed -i "s/\${destroys}/${destroys}/g" payload.json
+          # Top 10 resource addresses per action
+          creates_list=$(jq -r '
+            [(.resource_changes // [])[]
+             | select((.change.actions // []) | index("create"))
+             | .address] | .[0:10]
+            | if length==0 then "none" else map("• `" + . + "`") | join("\n") end
+          ' $TF_DIR/plan.json)
+
+          updates_list=$(jq -r '
+            [(.resource_changes // [])[]
+             | select((.change.actions // []) | index("update"))
+             | .address] | .[0:10]
+            | if length==0 then "none" else map("• `" + . + "`") | join("\n") end
+          ' $TF_DIR/plan.json)
+
+          deletes_list=$(jq -r '
+            [(.resource_changes // [])[]
+             | select((.change.actions // []) | index("delete"))
+             | .address] | .[0:10]
+            | if length==0 then "none" else map("• `" + . + "`") | join("\n") end
+          ' $TF_DIR/plan.json)
+
+          # Small diff excerpt (first ~30 change lines)
+          diff_snippet="$(grep -E '^[[:space:]]*[~+-]' "$TF_DIR/plan.txt" | head -n 30)"
+
+          # Build payload safely with jq
+          jq -n \
+            --arg channel "$SLACK_CHANNEL" \
+            --arg drift "$DRIFT_ID" \
+            --arg runurl "$RUN_URL" \
+            --arg fails "$FAILS" \
+            --arg warns "$WARNS" \
+            --arg adds "$adds" \
+            --arg changes "$changes" \
+            --arg destroys "$destroys" \
+            --arg creates "$creates_list" \
+            --arg updates "$updates_list" \
+            --arg deletes "$deletes_list" \
+            --arg diff "$diff_snippet" \
+            '
+            {
+              channel: $channel,
+              text: "Terraform drift detected",
+              blocks: [
+                { "type": "header", "text": { "type": "plain_text", "text": "Terraform Drift Detected" } },
+                { "type": "section", "fields": [
+                    { "type": "mrkdwn", "text": "*Drift ID:*\n\($drift)" },
+                    { "type": "mrkdwn", "text": "*Repo/Run:*\n<\($runurl)|Open run>" }
+                  ]},
+                { "type": "section", "fields": [
+                    { "type": "mrkdwn", "text": "*Adds:* \($adds)" },
+                    { "type": "mrkdwn", "text": "*Changes:* \($changes)" },
+                    { "type": "mrkdwn", "text": "*Destroys:* \($destroys)" }
+                  ]},
+                { "type": "section", "text": { "type": "mrkdwn", "text": "*Creates (up to 10):*\n\($creates)" } },
+                { "type": "section", "text": { "type": "mrkdwn", "text": "*Updates (up to 10):*\n\($updates)" } },
+                { "type": "section", "text": { "type": "mrkdwn", "text": "*Deletes (up to 10):*\n\($deletes)" } },
+                { "type": "section", "text": { "type": "mrkdwn", "text": "*Plan snippet:*\n```" + $diff + "```" } },
+                { "type": "context", "elements": [
+                    { "type": "mrkdwn", "text": "*CIS pre-check:* \($fails) failing checks, \($warns) warnings" }
+                  ]},
+                { "type": "actions", "elements": [
+                    { "type": "button", "text": { "type": "plain_text", "text": "Approve Remediation" }, "style": "primary",
+                      "action_id": "approve_remediation", "value": "approve" },
+                    { "type": "button", "text": { "type": "plain_text", "text": "Reject" }, "style": "danger",
+                      "action_id": "reject_remediation", "value": "reject" }
+                  ]}
+              ]
+            }' > payload.json
 
       - name: Post to Slack
         if: steps.payload.outcome == 'success'
