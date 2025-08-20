@@ -2,7 +2,7 @@ name: Detect Terraform Drift
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "* 5 * * *"
   workflow_dispatch:
     inputs:
       force_slack:
