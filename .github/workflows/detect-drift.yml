@@ -4,11 +4,6 @@ on:
   schedule:
     - cron: "*/5 * * * *" # every 5 minutes
   workflow_dispatch:
-    inputs:
-      force_slack:
-        type: boolean
-        default: false
-        description: "Post to Slack even without drift"
 
 concurrency:
   group: drift-${{ github.ref }}
