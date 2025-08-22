@@ -2,7 +2,7 @@ name: Detect Terraform Drift
 
 on:
   schedule:
-    - cron: "*/5 * * * *"  # every 5 minutes
+    - cron: "* 5 * * *" # every 5 minutes
   workflow_dispatch:
     inputs:
       force_slack:
@@ -25,9 +25,7 @@ env:
   TF_DIR: "terraform"
   SLACK_CHANNEL: "C097WJUFJCU"
   OIDC_ROLE_ARN: "arn:aws:iam::147997134125:role/GitHubTerraformPlanRole"
-  # --- New for metrics ingest + CIS gating ---
-  METRICS_INGEST_URL: ""   # e.g., https://<api-gw-id>.execute-api.<region>.amazonaws.com/prod/metrics/t012
-  CIS_BLOCK_MODE: "warn"    # set to "block" to disable Approve when Checkov fails > 0
+  TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
 
 jobs:
   detect:
@@ -37,21 +35,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      # Resolve $HOME for later steps/expressions
-      - name: Resolve HOME path
-        id: home
-        run: echo "home=$HOME" >> $GITHUB_OUTPUT
-
-      # Configure TF plugin cache with an absolute path
-      - name: Configure TF plugin cache path (absolute)
-        run: |
-          mkdir -p "$HOME/.terraform.d/plugin-cache"
-          echo "TF_PLUGIN_CACHE_DIR=$HOME/.terraform.d/plugin-cache" >> "$GITHUB_ENV"
-
-      # t0: job start
-      - name: Record t0
-        run: echo "T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
 
       - name: Configure AWS (OIDC AssumeRole)
         uses: aws-actions/configure-aws-credentials@v4
@@ -64,6 +47,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pipx jq
           echo "$HOME/.local/bin" >> $GITHUB_PATH
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
 
       - name: Who am I (sanity)
         run: aws sts get-caller-identity
@@ -80,7 +64,7 @@ jobs:
         with:
           path: |
             ${{ env.TF_DIR }}/.terraform
-            ${{ steps.home.outputs.home }}/.terraform.d/plugin-cache
+            ~/.terraform.d/plugin-cache
           key: tf-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
 
       - name: Terraform init
@@ -101,22 +85,26 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: |
           set +e
+          # Capture stdout/stderr separately for better failure UX
           terraform plan -refresh-only -detailed-exitcode -lock-timeout=2m -out=tfplan.out -no-color -input=false \
             1>plan_stdout.txt 2>plan_error.txt
           code=$?
           echo "exitcode=$code" >> $GITHUB_OUTPUT
-          if [ "$code" -eq 1 ]; then
-            echo "Plan failed"; exit 0
+
+          if [ $code -eq 1 ]; then
+            # Failure: keep a stub JSON for downstream steps; drift_id derived from error content
+            echo '{}' > plan.json
+            sha="$(sha256sum plan_error.txt | awk '{print $1}')"
+            echo "drift_id=${sha::12}-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
+            exit 0
           fi
+
           # Success (0) or Drift (2): render artifacts and drift_id from plan.json
           cp plan_stdout.txt plan.txt
           terraform show -json tfplan.out > plan.json
           sha="$(sha256sum plan.json | awk '{print $1}')"
           echo "drift_id=${sha::12}-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
-
-      # t1: plan finished
-      - name: Record t1
-        run: echo "T1=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
+          exit 0
 
       - name: Debug plan exit code
         run: echo "Plan exit code was:${{ steps.plan.outputs.exitcode }}"
@@ -179,13 +167,12 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           WS: ${{ steps.ws.outputs.name }}
           REGION: ${{ env.AWS_REGION }}
-          BLOCK_MODE: ${{ env.CIS_BLOCK_MODE }}
         run: |
-          set -euo pipefail
+          # Sanitize env tag for action_id
           env_tag="${WS}/${REGION}"
-          safe_env_tag="$(echo "$env_tag" | tr -cd '[:alnum:]._/\- ' | tr ' /' '--')"
+          safe_env_tag="$(echo "$env_tag" | tr -cd '[:alnum:]._-/ ' | tr ' /' '--')"
 
-          # Summarise adds/changes/destroys
+          # 1) JSON-based counts
           summary="$(jq -r '
             (.resource_changes // [])
             | reduce .[] as $rc (
@@ -198,35 +185,43 @@ jobs:
           changes=$(echo "$summary" | jq -r .changes)
           destroys=$(echo "$summary" | jq -r .destroys)
 
-          creates_list=$(jq -r '
+          # JSON-derived lists (top 10)
+          creates_list_json=$(jq -r '
             [(.resource_changes // [])[] | select((.change.actions // []) | index("create")) | .address] | .[0:10]
             | if length==0 then "" else map("• `" + . + "`") | join("\n") end
           ' "$TF_DIR/plan.json")
-          updates_list=$(jq -r '
+
+          updates_list_json=$(jq -r '
             [(.resource_changes // [])[] | select((.change.actions // []) | index("update")) | .address] | .[0:10]
             | if length==0 then "" else map("• `" + . + "`") | join("\n") end
           ' "$TF_DIR/plan.json")
-          deletes_list=$(jq -r '
+
+          deletes_list_json=$(jq -r '
             [(.resource_changes // [])[] | select((.change.actions // []) | index("delete")) | .address] | .[0:10]
             | if length==0 then "" else map("• `" + . + "`") | join("\n") end
           ' "$TF_DIR/plan.json")
 
-          diff_snippet="$(grep -E '^[[:space:]]*[~+-]' "$TF_DIR/plan.txt" | head -n 30 || true)"
+          total=$((adds + changes + destroys))
+          if [ "$total" -eq 0 ]; then
+            creates_txt=$(grep -E '^[[:space:]]*\+ resource "' "$TF_DIR/plan.txt" | sed -E 's/^ *\+ resource "([^"]+)" "([^"]+)".*$/\1.\2/' | head -n 10 || true)
+            updates_txt=$(grep -E '^[[:space:]]*~ resource "' "$TF_DIR/plan.txt" | sed -E 's/^ *~ resource "([^"]+)" "([^"]+)".*$/\1.\2/' | head -n 10 || true)
+            deletes_txt=$(grep -E '^[[:space:]]*- resource "' "$TF_DIR/plan.txt" | sed -E 's/^ *- resource "([^"]+)" "([^"]+)".*$/\1.\2/' | head -n 10 || true)
 
-          # Build the final block (either "blocked" note or action buttons) WITHOUT heredocs
-          if [ "$BLOCK_MODE" = "block" ] && [ "${FAILS:-0}" -gt 0 ]; then
-            printf '%s\n' '{ "type": "section", "text": { "type": "mrkdwn", "text": "*Remediation blocked:* failing CIS checks present. Approval disabled." } }' > /tmp/block.json
+            adds=$(printf "%s\n" "$creates_txt" | grep -c . || echo 0)
+            changes=$(printf "%s\n" "$updates_txt" | grep -c . || echo 0)
+            destroys=$(printf "%s\n" "$deletes_txt" | grep -c . || echo 0)
+
+            if [ -n "$creates_txt" ]; then creates_list=$(printf "%s\n" "$creates_txt" | sed 's/^/• `/' | sed 's/$/`/'); else creates_list="none"; fi
+            if [ -n "$updates_txt" ]; then updates_list=$(printf "%s\n" "$updates_txt" | sed 's/^/• `/' | sed 's/$/`/'); else updates_list="none"; fi
+            if [ -n "$deletes_txt" ]; then deletes_list=$(printf "%s\n" "$deletes_txt" | sed 's/^/• `/' | sed 's/$/`/'); else deletes_list="none"; fi
           else
-            jq -n --arg env "$safe_env_tag" --arg drift "$DRIFT_ID" '{
-              type:"actions",
-              elements:[
-                {type:"button", text:{type:"plain_text", text:"Approve Remediation"}, style:"primary", action_id:("approve_remediation::"+$env+"::"+$drift), value:"approve"},
-                {type:"button", text:{type:"plain_text", text:"Reject"}, style:"danger", action_id:("reject_remediation::"+$env+"::"+$drift), value:"reject"}
-              ]
-            }' > /tmp/block.json
+            creates_list="${creates_list_json:-none}"
+            updates_list="${updates_list_json:-none}"
+            deletes_list="${deletes_list_json:-none}"
           fi
 
-          # Full payload
+          diff_snippet="$(grep -E '^[[:space:]]*[~+-]' "$TF_DIR/plan.txt" | head -n 30)"
+
           jq -n \
             --arg channel "$SLACK_CHANNEL" \
             --arg drift "$DRIFT_ID" \
@@ -241,7 +236,7 @@ jobs:
             --arg deletes "$deletes_list" \
             --arg diff "$diff_snippet" \
             --arg envtag "$env_tag" \
-            --slurpfile last /tmp/block.json \
+            --arg safeenv "$safe_env_tag" \
             '
             {
               channel: $channel,
@@ -267,7 +262,14 @@ jobs:
                 { "type": "context", "elements": [
                     { "type": "mrkdwn", "text": "*CIS pre-check:* \($fails) failing checks, \($warns) warnings" }
                   ]},
-                $last[0]
+                { "type": "actions", "elements": [
+                    { "type": "button",
+                      "text": { "type": "plain_text", "text": "Approve Remediation" }, "style": "primary",
+                      "action_id": ("approve_remediation::" + $safeenv + "::" + $drift), "value": "approve" },
+                    { "type": "button",
+                      "text": { "type": "plain_text", "text": "Reject" }, "style": "danger",
+                      "action_id": ("reject_remediation::" + $safeenv + "::" + $drift), "value": "reject" }
+                  ]}
               ]
             }' > payload.json
 
@@ -344,47 +346,6 @@ jobs:
           path: slack-${{ steps.plan.outputs.drift_id }}.json
           retention-days: 7
 
-      # t2 + metrics JSON + optional ingest
-      - name: Record t2, write metrics, ingest
-        if: ${{ (steps.payload.outcome == 'success') || (steps.payload_failed.outcome == 'success') }}
-        env:
-          DRIFT_ID: ${{ steps.plan.outputs.drift_id }}
-          FAILS: ${{ steps.checkov.outputs.failed }}
-          METRICS_INGEST_URL: ${{ env.METRICS_INGEST_URL }}
-          METRICS_INGEST_TOKEN: ${{ secrets.METRICS_INGEST_TOKEN }}
-        run: |
-          echo "T2=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
-
-          # Coerce FAILS to a number (default 0)
-          PRE="${FAILS:-0}"
-          if ! [[ "$PRE" =~ ^[0-9]+$ ]]; then PRE=0; fi
-
-          # Write metrics JSON without heredocs
-          jq -n \
-            --arg drift "$DRIFT_ID" \
-            --arg t0 "$T0" \
-            --arg t1 "$T1" \
-            --arg t2 "$T2" \
-            --argjson pre "$PRE" \
-            '{drift_id:$drift, t0:$t0, t1:$t1, t2:$t2, pre_cis_failed:$pre}' \
-            > "metrics-${DRIFT_ID}.json"
-
-          # Optional ingest to Flask
-          if [ -n "${METRICS_INGEST_URL}" ]; then
-            curl -sS -X POST -H "Content-Type: application/json" \
-              -H "X-Auth-Token: ${METRICS_INGEST_TOKEN}" \
-              --data-binary @"metrics-${DRIFT_ID}.json" \
-              "${METRICS_INGEST_URL}" || true
-          fi
-
-      - name: Upload metrics artifact
-        if: ${{ (steps.payload.outcome == 'success') || (steps.payload_failed.outcome == 'success') }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: metrics-${{ steps.plan.outputs.drift_id }}
-          path: metrics-${{ steps.plan.outputs.drift_id }}.json
-          retention-days: 14
-
       - name: No drift (exit=0)
-        if: ${{ steps.plan.outputs.exitcode == '0' && (github.event_name != 'workflow_dispatch' || github.event.inputs.force_slack != 'true') }}
+        if: ${{ steps.plan.outputs.exitcode == '0' && !(github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true') }}
         run: echo "No drift."
