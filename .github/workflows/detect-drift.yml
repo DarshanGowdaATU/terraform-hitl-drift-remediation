@@ -346,9 +346,22 @@ jobs:
           METRICS_INGEST_TOKEN: ${{ secrets.METRICS_INGEST_TOKEN }}
         run: |
           echo "T2=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
-          cat > "metrics-${DRIFT_ID}.json" <<EOF
-{"drift_id":"${DRIFT_ID}","t0":"${T0}","t1":"${T1}","t2":"${T2}","pre_cis_failed":${FAILS:-0}}
-EOF
+
+          # Coerce FAILS to a number (default 0)
+          PRE="${FAILS:-0}"
+          if ! [[ "$PRE" =~ ^[0-9]+$ ]]; then PRE=0; fi
+
+          # Write metrics JSON without heredocs
+          jq -n \
+            --arg drift "$DRIFT_ID" \
+            --arg t0 "$T0" \
+            --arg t1 "$T1" \
+            --arg t2 "$T2" \
+            --argjson pre "$PRE" \
+            '{drift_id:$drift, t0:$t0, t1:$t1, t2:$t2, pre_cis_failed:$pre}' \
+            > "metrics-${DRIFT_ID}.json"
+
+          # Optional ingest to Flask
           if [ -n "${METRICS_INGEST_URL}" ]; then
             curl -sS -X POST -H "Content-Type: application/json" \
               -H "X-Auth-Token: ${METRICS_INGEST_TOKEN}" \
