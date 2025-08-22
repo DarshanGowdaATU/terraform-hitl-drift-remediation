@@ -2,7 +2,7 @@ name: Detect Terraform Drift
 
 on:
   schedule:
-    - cron: "* 5 * * *" # every 5 minutes
+    - cron: "*/5 * * * *"  # every 5 minutes
   workflow_dispatch:
     inputs:
       force_slack:
@@ -26,6 +26,9 @@ env:
   SLACK_CHANNEL: "C097WJUFJCU"
   OIDC_ROLE_ARN: "arn:aws:iam::147997134125:role/GitHubTerraformPlanRole"
   TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+  # --- New for metrics ingest + CIS gating ---
+  METRICS_INGEST_URL: ""   # e.g., https://<api-gw-id>.execute-api.<region>.amazonaws.com/prod/metrics/t012
+  CIS_BLOCK_MODE: "warn"    # set to "block" to disable Approve when Checkov fails > 0
 
 jobs:
   detect:
@@ -35,6 +38,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # t0: job start
+      - name: Record t0
+        run: echo "T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
 
       - name: Configure AWS (OIDC AssumeRole)
         uses: aws-actions/configure-aws-credentials@v4
@@ -85,26 +92,22 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: |
           set +e
-          # Capture stdout/stderr separately for better failure UX
           terraform plan -refresh-only -detailed-exitcode -lock-timeout=2m -out=tfplan.out -no-color -input=false \
             1>plan_stdout.txt 2>plan_error.txt
           code=$?
           echo "exitcode=$code" >> $GITHUB_OUTPUT
-
-          if [ $code -eq 1 ]; then
-            # Failure: keep a stub JSON for downstream steps; drift_id derived from error content
-            echo '{}' > plan.json
-            sha="$(sha256sum plan_error.txt | awk '{print $1}')"
-            echo "drift_id=${sha::12}-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
-            exit 0
+          if [ "$code" -eq 1 ]; then
+            echo "Plan failed"; exit 0
           fi
-
           # Success (0) or Drift (2): render artifacts and drift_id from plan.json
           cp plan_stdout.txt plan.txt
           terraform show -json tfplan.out > plan.json
           sha="$(sha256sum plan.json | awk '{print $1}')"
           echo "drift_id=${sha::12}-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
-          exit 0
+
+      # t1: plan finished
+      - name: Record t1
+        run: echo "T1=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
 
       - name: Debug plan exit code
         run: echo "Plan exit code was:${{ steps.plan.outputs.exitcode }}"
@@ -167,12 +170,12 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           WS: ${{ steps.ws.outputs.name }}
           REGION: ${{ env.AWS_REGION }}
+          BLOCK_MODE: ${{ env.CIS_BLOCK_MODE }}
         run: |
-          # Sanitize env tag for action_id
           env_tag="${WS}/${REGION}"
           safe_env_tag="$(echo "$env_tag" | tr -cd '[:alnum:]._-/ ' | tr ' /' '--')"
 
-          # 1) JSON-based counts
+          # JSON lists for block kit
           summary="$(jq -r '
             (.resource_changes // [])
             | reduce .[] as $rc (
@@ -185,42 +188,39 @@ jobs:
           changes=$(echo "$summary" | jq -r .changes)
           destroys=$(echo "$summary" | jq -r .destroys)
 
-          # JSON-derived lists (top 10)
-          creates_list_json=$(jq -r '
+          creates_list=$(jq -r '
             [(.resource_changes // [])[] | select((.change.actions // []) | index("create")) | .address] | .[0:10]
             | if length==0 then "" else map("• `" + . + "`") | join("\n") end
           ' "$TF_DIR/plan.json")
-
-          updates_list_json=$(jq -r '
+          updates_list=$(jq -r '
             [(.resource_changes // [])[] | select((.change.actions // []) | index("update")) | .address] | .[0:10]
             | if length==0 then "" else map("• `" + . + "`") | join("\n") end
           ' "$TF_DIR/plan.json")
-
-          deletes_list_json=$(jq -r '
+          deletes_list=$(jq -r '
             [(.resource_changes // [])[] | select((.change.actions // []) | index("delete")) | .address] | .[0:10]
             | if length==0 then "" else map("• `" + . + "`") | join("\n") end
           ' "$TF_DIR/plan.json")
 
-          total=$((adds + changes + destroys))
-          if [ "$total" -eq 0 ]; then
-            creates_txt=$(grep -E '^[[:space:]]*\+ resource "' "$TF_DIR/plan.txt" | sed -E 's/^ *\+ resource "([^"]+)" "([^"]+)".*$/\1.\2/' | head -n 10 || true)
-            updates_txt=$(grep -E '^[[:space:]]*~ resource "' "$TF_DIR/plan.txt" | sed -E 's/^ *~ resource "([^"]+)" "([^"]+)".*$/\1.\2/' | head -n 10 || true)
-            deletes_txt=$(grep -E '^[[:space:]]*- resource "' "$TF_DIR/plan.txt" | sed -E 's/^ *- resource "([^"]+)" "([^"]+)".*$/\1.\2/' | head -n 10 || true)
-
-            adds=$(printf "%s\n" "$creates_txt" | grep -c . || echo 0)
-            changes=$(printf "%s\n" "$updates_txt" | grep -c . || echo 0)
-            destroys=$(printf "%s\n" "$deletes_txt" | grep -c . || echo 0)
-
-            if [ -n "$creates_txt" ]; then creates_list=$(printf "%s\n" "$creates_txt" | sed 's/^/• `/' | sed 's/$/`/'); else creates_list="none"; fi
-            if [ -n "$updates_txt" ]; then updates_list=$(printf "%s\n" "$updates_txt" | sed 's/^/• `/' | sed 's/$/`/'); else updates_list="none"; fi
-            if [ -n "$deletes_txt" ]; then deletes_list=$(printf "%s\n" "$deletes_txt" | sed 's/^/• `/' | sed 's/$/`/'); else deletes_list="none"; fi
-          else
-            creates_list="${creates_list_json:-none}"
-            updates_list="${updates_list_json:-none}"
-            deletes_list="${deletes_list_json:-none}"
-          fi
-
           diff_snippet="$(grep -E '^[[:space:]]*[~+-]' "$TF_DIR/plan.txt" | head -n 30)"
+
+          # Block vs Warn mode: last block differs
+          if [ "$BLOCK_MODE" = "block" ] && [ "${FAILS:-0}" -gt 0 ]; then
+            cat > /tmp/block.json <<'JSON'
+{ "type": "section", "text": { "type": "mrkdwn", "text": "*Remediation blocked:* failing CIS checks present. Approval disabled." } }
+JSON
+          else
+            cat > /tmp/block.json <<'JSON'
+{ "type": "actions", "elements": [
+    { "type": "button",
+      "text": { "type": "plain_text", "text": "Approve Remediation" }, "style": "primary",
+      "action_id": "approve_remediation::__ENV__::__DRIFT__", "value": "approve" },
+    { "type": "button",
+      "text": { "type": "plain_text", "text": "Reject" }, "style": "danger",
+      "action_id": "reject_remediation::__ENV__::__DRIFT__", "value": "reject" }
+  ] }
+JSON
+            sed -i "s/__ENV__/${safe_env_tag}/g; s/__DRIFT__/${DRIFT_ID}/g" /tmp/block.json
+          fi
 
           jq -n \
             --arg channel "$SLACK_CHANNEL" \
@@ -236,7 +236,7 @@ jobs:
             --arg deletes "$deletes_list" \
             --arg diff "$diff_snippet" \
             --arg envtag "$env_tag" \
-            --arg safeenv "$safe_env_tag" \
+            --slurpfile last /tmp/block.json \
             '
             {
               channel: $channel,
@@ -262,14 +262,7 @@ jobs:
                 { "type": "context", "elements": [
                     { "type": "mrkdwn", "text": "*CIS pre-check:* \($fails) failing checks, \($warns) warnings" }
                   ]},
-                { "type": "actions", "elements": [
-                    { "type": "button",
-                      "text": { "type": "plain_text", "text": "Approve Remediation" }, "style": "primary",
-                      "action_id": ("approve_remediation::" + $safeenv + "::" + $drift), "value": "approve" },
-                    { "type": "button",
-                      "text": { "type": "plain_text", "text": "Reject" }, "style": "danger",
-                      "action_id": ("reject_remediation::" + $safeenv + "::" + $drift), "value": "reject" }
-                  ]}
+                $last[0]
               ]
             }' > payload.json
 
@@ -345,6 +338,34 @@ jobs:
           name: slack-${{ steps.plan.outputs.drift_id }}
           path: slack-${{ steps.plan.outputs.drift_id }}.json
           retention-days: 7
+
+      # t2 + metrics JSON + optional ingest
+      - name: Record t2, write metrics, ingest
+        if: ${{ (steps.payload.outcome == 'success') || (steps.payload_failed.outcome == 'success') }}
+        env:
+          DRIFT_ID: ${{ steps.plan.outputs.drift_id }}
+          FAILS: ${{ steps.checkov.outputs.failed }}
+          METRICS_INGEST_URL: ${{ env.METRICS_INGEST_URL }}
+          METRICS_INGEST_TOKEN: ${{ secrets.METRICS_INGEST_TOKEN }}
+        run: |
+          echo "T2=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
+          cat > "metrics-${DRIFT_ID}.json" <<EOF
+{"drift_id":"${DRIFT_ID}","t0":"${T0}","t1":"${T1}","t2":"${T2}","pre_cis_failed":${FAILS:-0}}
+EOF
+          if [ -n "${METRICS_INGEST_URL}" ]; then
+            curl -sS -X POST -H "Content-Type: application/json" \
+              -H "X-Auth-Token: ${METRICS_INGEST_TOKEN}" \
+              --data-binary @"metrics-${DRIFT_ID}.json" \
+              "${METRICS_INGEST_URL}" || true
+          fi
+
+      - name: Upload metrics artifact
+        if: ${{ (steps.payload.outcome == 'success') || (steps.payload_failed.outcome == 'success') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-${{ steps.plan.outputs.drift_id }}
+          path: metrics-${{ steps.plan.outputs.drift_id }}.json
+          retention-days: 14
 
       - name: No drift (exit=0)
         if: ${{ steps.plan.outputs.exitcode == '0' && !(github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true') }}
