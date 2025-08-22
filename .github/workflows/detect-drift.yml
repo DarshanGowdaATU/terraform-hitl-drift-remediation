@@ -25,7 +25,6 @@ env:
   TF_DIR: "terraform"
   SLACK_CHANNEL: "C097WJUFJCU"
   OIDC_ROLE_ARN: "arn:aws:iam::147997134125:role/GitHubTerraformPlanRole"
-  TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
   # --- New for metrics ingest + CIS gating ---
   METRICS_INGEST_URL: ""   # e.g., https://<api-gw-id>.execute-api.<region>.amazonaws.com/prod/metrics/t012
   CIS_BLOCK_MODE: "warn"    # set to "block" to disable Approve when Checkov fails > 0
@@ -38,6 +37,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Resolve $HOME for later steps/expressions
+      - name: Resolve HOME path
+        id: home
+        run: echo "home=$HOME" >> $GITHUB_OUTPUT
+
+      # Configure TF plugin cache with an absolute path
+      - name: Configure TF plugin cache path (absolute)
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          echo "TF_PLUGIN_CACHE_DIR=$HOME/.terraform.d/plugin-cache" >> "$GITHUB_ENV"
 
       # t0: job start
       - name: Record t0
@@ -54,7 +64,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pipx jq
           echo "$HOME/.local/bin" >> $GITHUB_PATH
-          mkdir -p "$HOME/.terraform.d/plugin-cache"
 
       - name: Who am I (sanity)
         run: aws sts get-caller-identity
@@ -71,7 +80,7 @@ jobs:
         with:
           path: |
             ${{ env.TF_DIR }}/.terraform
-            ~/.terraform.d/plugin-cache
+            ${{ steps.home.outputs.home }}/.terraform.d/plugin-cache
           key: tf-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
 
       - name: Terraform init
@@ -262,7 +271,6 @@ jobs:
               ]
             }' > payload.json
 
-
       - name: Post to Slack (drift or forced)
         if: steps.payload.outcome == 'success'
         env:
@@ -378,5 +386,5 @@ jobs:
           retention-days: 14
 
       - name: No drift (exit=0)
-        if: ${{ steps.plan.outputs.exitcode == '0' && !(github.event_name == 'workflow_dispatch' && github.event.inputs.force_slack == 'true') }}
+        if: ${{ steps.plan.outputs.exitcode == '0' && (github.event_name != 'workflow_dispatch' || github.event.inputs.force_slack != 'true') }}
         run: echo "No drift."
