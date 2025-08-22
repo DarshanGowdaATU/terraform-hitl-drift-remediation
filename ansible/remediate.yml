@@ -1,10 +1,38 @@
 ---
-- name: Example Remediation
+- name: Remediate drift and run post-CIS
   hosts: localhost
-  gather_facts: no
+  connection: local
+  gather_facts: false
+
+  vars:
+    tf_dir: "{{ playbook_dir }}/../terraform"
+    logs_dir: "{{ playbook_dir }}/../logs"
+    checkov_json: "{{ logs_dir }}/checkov-post.json"
+
   tasks:
-    - name: Placeholder - Apply Terraform
+    - name: Ensure logs dir exists
+      file:
+        path: "{{ logs_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Terraform apply
       command: terraform apply -auto-approve
       args:
-        chdir: ../terraform
+        chdir: "{{ tf_dir }}"
+      register: tf_apply
+      changed_when: "'No changes' not in tf_apply.stdout"
 
+    - name: Run post-remediation CIS scan
+      command: checkov -d "{{ tf_dir }}" -o json
+      register: checkov_post
+      failed_when: false
+      changed_when: false
+      environment:
+        PATH: "{{ ansible_env.PATH }}:/home/ec2-user/.local/bin"  # for pipx installs
+
+    - name: Write post-Checkov summary to file
+      copy:
+        dest: "{{ checkov_json }}"
+        content: "{{ checkov_post.stdout }}"
+        mode: "0644"
