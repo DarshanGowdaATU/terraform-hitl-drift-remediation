@@ -172,10 +172,11 @@ jobs:
           REGION: ${{ env.AWS_REGION }}
           BLOCK_MODE: ${{ env.CIS_BLOCK_MODE }}
         run: |
+          set -euo pipefail
           env_tag="${WS}/${REGION}"
           safe_env_tag="$(echo "$env_tag" | tr -cd '[:alnum:]._-/ ' | tr ' /' '--')"
 
-          # JSON lists for block kit
+          # Summarise adds/changes/destroys
           summary="$(jq -r '
             (.resource_changes // [])
             | reduce .[] as $rc (
@@ -201,27 +202,22 @@ jobs:
             | if length==0 then "" else map("• `" + . + "`") | join("\n") end
           ' "$TF_DIR/plan.json")
 
-          diff_snippet="$(grep -E '^[[:space:]]*[~+-]' "$TF_DIR/plan.txt" | head -n 30)"
+          diff_snippet="$(grep -E '^[[:space:]]*[~+-]' "$TF_DIR/plan.txt" | head -n 30 || true)"
 
-          # Block vs Warn mode: last block differs
+          # Build the final block (either "blocked" note or action buttons) WITHOUT heredocs
           if [ "$BLOCK_MODE" = "block" ] && [ "${FAILS:-0}" -gt 0 ]; then
-            cat > /tmp/block.json <<'JSON'
-{ "type": "section", "text": { "type": "mrkdwn", "text": "*Remediation blocked:* failing CIS checks present. Approval disabled." } }
-JSON
+            printf '%s\n' '{ "type": "section", "text": { "type": "mrkdwn", "text": "*Remediation blocked:* failing CIS checks present. Approval disabled." } }' > /tmp/block.json
           else
-            cat > /tmp/block.json <<'JSON'
-{ "type": "actions", "elements": [
-    { "type": "button",
-      "text": { "type": "plain_text", "text": "Approve Remediation" }, "style": "primary",
-      "action_id": "approve_remediation::__ENV__::__DRIFT__", "value": "approve" },
-    { "type": "button",
-      "text": { "type": "plain_text", "text": "Reject" }, "style": "danger",
-      "action_id": "reject_remediation::__ENV__::__DRIFT__", "value": "reject" }
-  ] }
-JSON
-            sed -i "s/__ENV__/${safe_env_tag}/g; s/__DRIFT__/${DRIFT_ID}/g" /tmp/block.json
+            jq -n --arg env "$safe_env_tag" --arg drift "$DRIFT_ID" '{
+              type:"actions",
+              elements:[
+                {type:"button", text:{type:"plain_text", text:"Approve Remediation"}, style:"primary", action_id:("approve_remediation::"+$env+"::"+$drift), value:"approve"},
+                {type:"button", text:{type:"plain_text", text:"Reject"}, style:"danger", action_id:("reject_remediation::"+$env+"::"+$drift), value:"reject"}
+              ]
+            }' > /tmp/block.json
           fi
 
+          # Full payload
           jq -n \
             --arg channel "$SLACK_CHANNEL" \
             --arg drift "$DRIFT_ID" \
@@ -265,6 +261,7 @@ JSON
                 $last[0]
               ]
             }' > payload.json
+
 
       - name: Post to Slack (drift or forced)
         if: steps.payload.outcome == 'success'
