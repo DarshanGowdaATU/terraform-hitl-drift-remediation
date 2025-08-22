@@ -183,7 +183,7 @@ jobs:
         run: |
           set -euo pipefail
           env_tag="${WS}/${REGION}"
-          safe_env_tag="$(echo "$env_tag" | tr -cd '[:alnum:]._-/ ' | tr ' /' '--')"
+          safe_env_tag="$(echo "$env_tag" | tr -cd '[:alnum:]._/\- ' | tr ' /' '--')"
 
           # Summarise adds/changes/destroys
           summary="$(jq -r '
