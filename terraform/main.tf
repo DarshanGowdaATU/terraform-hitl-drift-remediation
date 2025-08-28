@@ -1,12 +1,21 @@
 # Availability Zones
 data "aws_availability_zones" "available" {}
 
+# Extra data for S3 naming
+data "aws_caller_identity" "this" {}
+data "aws_region" "this" {}
+
 # -------- Tunable instance types resolved via locals --------
 locals {
   public_instance_type  = coalesce(var.public_instance_type,  var.instance_type)
   private_instance_type = coalesce(var.private_instance_type, var.instance_type)
   jump_instance_type    = coalesce(var.jump_box_instance_type, var.instance_type)
   tags_base             = var.common_tags
+}
+
+# Deterministic, globally-unique bucket name (uses .id to avoid deprecated "name")
+locals {
+  private_bucket_name = lower("${var.name_prefix}-${data.aws_caller_identity.this.account_id}-${data.aws_region.this.id}-private")
 }
 
 # ---------------- VPC + IGW ----------------
@@ -143,5 +152,85 @@ resource "aws_instance" "jump_box_instance" {
 
   tags = merge(local.tags_base, {
     Name = "${var.name_prefix}-jump"
+  })
+}
+
+# ================================
+# Private S3 bucket (locked down)
+# ================================
+resource "aws_s3_bucket" "private_data" {
+  bucket = local.private_bucket_name
+
+  tags = merge(local.tags_base, {
+    Name = "${var.name_prefix}-s3-private"
+  })
+}
+
+# Disable ACLs (bucket-owner enforced)
+resource "aws_s3_bucket_ownership_controls" "private_data" {
+  bucket = aws_s3_bucket.private_data.id
+  rule {
+    object_ownership = "BucketOwnerEnforced"
+  }
+}
+
+# Block all public access
+resource "aws_s3_bucket_public_access_block" "private_data" {
+  bucket                  = aws_s3_bucket.private_data.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# Versioning
+resource "aws_s3_bucket_versioning" "private_data" {
+  bucket = aws_s3_bucket.private_data.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# Default SSE (AES256)
+resource "aws_s3_bucket_server_side_encryption_configuration" "private_data" {
+  bucket = aws_s3_bucket.private_data.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# TLS-only policy (deny non-HTTPS)
+resource "aws_s3_bucket_policy" "private_data_tls_only" {
+  bucket = aws_s3_bucket.private_data.id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Sid       = "DenyInsecureTransport",
+        Effect    = "Deny",
+        Principal = "*",
+        Action    = "s3:*",
+        Resource  = [
+          aws_s3_bucket.private_data.arn,
+          "${aws_s3_bucket.private_data.arn}/*"
+        ],
+        Condition = {
+          Bool = { "aws:SecureTransport" = "false" }
+        }
+      }
+    ]
+  })
+}
+
+# ================================
+# IAM user: Developer
+# ================================
+resource "aws_iam_user" "developer" {
+  name = "Developer"
+
+  tags = merge(local.tags_base, {
+    Name = "${var.name_prefix}-user-developer"
   })
 }
