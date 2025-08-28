@@ -265,6 +265,3 @@ terraform.tfstate*
 * Terraform stack: `backend.tf`, `provider.tf`, `variables.tf`, `outputs.tf`, `main.tf`
 
 ```
-
-If you already pasted the earlier version, you can just patch the three fixed sections (table header + two code blocks).
-```
