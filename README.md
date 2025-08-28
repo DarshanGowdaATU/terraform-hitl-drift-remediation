@@ -1,13 +1,3 @@
-Short answer: almost—just a couple of markdown glitches to fix.
-
-What needs attention:
-
-1. The **“Before you start (fill these)”** table is missing the header row.
-2. The **Terraform backend** HCL code block didn’t render.
-3. The **OIDC trust policy** JSON block didn’t render.
-
-Here’s a corrected, copy-paste README with those fixed:
-
 ```markdown
 # Human-in-the-Loop Terraform Drift Remediation (AWS)
 
