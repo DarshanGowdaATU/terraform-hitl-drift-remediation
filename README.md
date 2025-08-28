@@ -1,3 +1,13 @@
+Short answer: almost—just a couple of markdown glitches to fix.
+
+What needs attention:
+
+1. The **“Before you start (fill these)”** table is missing the header row.
+2. The **Terraform backend** HCL code block didn’t render.
+3. The **OIDC trust policy** JSON block didn’t render.
+
+Here’s a corrected, copy-paste README with those fixed:
+
 ```markdown
 # Human-in-the-Loop Terraform Drift Remediation (AWS)
 
@@ -19,22 +29,6 @@ This repo implements a human-in-the-loop (HITL) pipeline:
 
 ---
 
-## Repository layout
-
-```
-
-.
-├─ backend.tf                 # S3 backend + DynamoDB lock (remote state)
-├─ provider.tf
-├─ variables.tf
-├─ outputs.tf
-├─ main.tf                    # VPC, subnets, SGs, EC2, private S3, IAM user
-├─ app.py                     # Flask: verifies Slack signatures, triggers remediation
-├─ remediate.yml              # Ansible playbook: apply + post-Checkov
-├─ detect-drift.yml           # GitHub Actions workflow (MOVE under .github/workflows/)
-└─ logs/                      # created at runtime (audit.log, metrics.csv, artifacts)
-
-````
 
 > **Required move:**  
 > GitHub Actions workflows must live under `.github/workflows/`  
@@ -49,13 +43,14 @@ If you later split by folders, keep `TF_DIR` in the workflow aligned with where 
 
 ## Before you start (fill these)
 
-|--------------------------|-----------------------------------------------|
-| `<state-bucket>`         | S3 bucket name for Terraform state            |
-| `<lock-table>`           | DynamoDB table name for state locks           |
-| `<aws-region>`           | e.g., `us-east-1`                             |
-| `<ACCOUNT_ID>`           | Your AWS account ID                           |
-| `<ORG>` / `<REPO>`       | Your GitHub org and repo                      |
-| `<api-gateway-domain>`   | Public HTTPS for Slack → API Gateway → Flask  |
+| Placeholder            | Replace with                                  |
+|------------------------|-----------------------------------------------|
+| `<state-bucket>`       | S3 bucket name for Terraform state            |
+| `<lock-table>`         | DynamoDB table name for state locks           |
+| `<aws-region>`         | e.g., `us-east-1`                             |
+| `<ACCOUNT_ID>`         | Your AWS account ID                           |
+| `<ORG>` / `<REPO>`     | Your GitHub org and repo                      |
+| `<api-gateway-domain>` | Public HTTPS for Slack → API Gateway → Flask  |
 
 ---
 
@@ -63,6 +58,17 @@ If you later split by folders, keep `TF_DIR` in the workflow aligned with where 
 
 `backend.tf` should declare an S3 backend with locking:
 
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "<state-bucket>"
+    key            = "global/terraform.tfstate"
+    region         = "<aws-region>"
+    dynamodb_table = "<lock-table>"
+    encrypt        = true
+  }
+}
+````
 
 Enable **versioning** on the bucket. Make sure the DDB table exists.
 
@@ -72,6 +78,24 @@ Enable **versioning** on the bucket. Make sure the DDB table exists.
 
 Create an IAM role that trusts GitHub OIDC and restricts usage to this repo/branch.
 
+**Trust policy example:**
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+      "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:<ORG>/<REPO>:ref:refs/heads/main" }
+    }
+  }]
+}
+```
 
 **GitHub → Settings → Secrets and variables → Actions → New repository secret**
 
@@ -243,7 +267,6 @@ terraform.tfstate*
 
 ---
 
-
 ## Source notes (files in this repo)
 
 * Workflow: `.github/workflows/detect-drift.yml`
@@ -253,5 +276,5 @@ terraform.tfstate*
 
 ```
 
-This is ready to paste. Replace the placeholders in the **Before you start** table and the JSON/HCL snippets, and move the workflow file to `.github/workflows/`.
+If you already pasted the earlier version, you can just patch the three fixed sections (table header + two code blocks).
 ```
